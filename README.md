@@ -29,7 +29,8 @@ both drivers.
 
 A motorised zoom and focus lens with its own controller board. The board
 connects to UART0 and takes Pelco-D frames at 57600 baud, address 1. It
-reports no position. The stock firmware lists the lens as 16x zoom.
+reports no position. The lens has 5x optical zoom. The stock firmware's
+configuration says 16x, which does not match the optics.
 
 On a camera with this lens, UART0 is taken, so flight-controller telemetry
 has to come in on another pad. See [Lens variant](#lens-variant).
