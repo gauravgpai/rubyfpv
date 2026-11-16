@@ -1,0 +1,11 @@
+#!/bin/sh
+#
+# wifibroadcast's wfb_tun (the IP tunnel over the link, 10.5.0.10) and vtund
+# need /dev/net/tun. TUN is a module in this kernel; load it before
+# S98wifibroadcast.
+
+case "$1" in
+	start)
+		modprobe tun 2>/dev/null
+		;;
+esac

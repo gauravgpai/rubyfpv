@@ -1,0 +1,276 @@
+From: cv610-fpv
+Subject: [PATCH] Board type for Hi3516CV608/CV610/CV613 + IMX335 2-lane
+
+Adds BOARD_TYPE_OPENIPC_HISI_CV610 (33). Shared code: board name and
+hardware_board_is_openipc() only, so every existing board (vehicle or
+controller) takes the same code paths as before. Not a Goke board, so the
+controller allows adaptive video and live camera changes.
+
+Vehicle on cv610/cv608: detected from ipcinfo -c; 60 fps and 7 Mbps defaults
+(as SigmaStar); OTA from the controller off (its binaries are for other
+SoCs); 2-lane IMX335 profile chosen from the fps with video0.size clamped to
+the capture window; IR-cut on GPIO 1/9.
+---
+diff --git a/code/base/hardware.cpp b/code/base/hardware.cpp
+index 1306ef3..934b328 100644
+--- a/code/base/hardware.cpp
++++ b/code/base/hardware.cpp
+@@ -575,6 +575,8 @@ void _hardware_detect_board_openipc(char* szBoardId)
+       s_uHardwareBoardType = BOARD_TYPE_OPENIPC_SIGMASTAR_338Q;
+    if ( NULL != strstr(szBoardId, "ssc33x") )
+       s_uHardwareBoardType = BOARD_TYPE_OPENIPC_SIGMASTAR_338Q;
++   if ( NULL != strstr(szBoardId, "hi3516cv6") )
++      s_uHardwareBoardType = BOARD_TYPE_OPENIPC_HISI_CV610;
+    #endif
+ }
+ 
+@@ -865,6 +867,15 @@ int hardware_board_is_openipc(u32 uBoardType)
+       return 1;
+    if ( (uBoardType & BOARD_TYPE_MASK) == BOARD_TYPE_OPENIPC_SIGMASTAR_338Q )
+       return 1;
++   if ( (uBoardType & BOARD_TYPE_MASK) == BOARD_TYPE_OPENIPC_HISI_CV610 )
++      return 1;
++   return 0;
++}
++
++int hardware_board_is_hisi_cv610(u32 uBoardType)
++{
++   if ( (uBoardType & BOARD_TYPE_MASK) == BOARD_TYPE_OPENIPC_HISI_CV610 )
++      return 1;
+    return 0;
+ }
+ 
+diff --git a/code/base/hardware.h b/code/base/hardware.h
+index 99751d3..42321a6 100644
+--- a/code/base/hardware.h
++++ b/code/base/hardware.h
+@@ -31,6 +31,9 @@
+ #define BOARD_TYPE_OPENIPC_GOKE200 30
+ #define BOARD_TYPE_OPENIPC_GOKE210 31
+ #define BOARD_TYPE_OPENIPC_GOKE300 32
++// HiSilicon Hi3516CV608 / CV610 / CV613 (majestic, like the Goke boards, but with a
++// live encoder API: adaptive video and live camera changes work).
++#define BOARD_TYPE_OPENIPC_HISI_CV610 33
+ 
+ #define BOARD_TYPE_OPENIPC_SIGMASTAR_338Q 40
+ 
+@@ -114,6 +117,7 @@ int hardware_board_is_radxa(u32 uBoardType);
+ int hardware_board_is_openipc(u32 uBoardType);
+ int hardware_board_is_goke(u32 uBoardType);
+ int hardware_board_is_sigmastar(u32 uBoardType);
++int hardware_board_is_hisi_cv610(u32 uBoardType);
+ 
+ void hardware_enum_joystick_interfaces();
+ int hardware_get_joystick_interfaces_count();
+diff --git a/code/base/hardware_cam_maj.cpp b/code/base/hardware_cam_maj.cpp
+index 486ea8a..338023e 100644
+--- a/code/base/hardware_cam_maj.cpp
++++ b/code/base/hardware_cam_maj.cpp
+@@ -666,6 +666,44 @@ void _hardware_camera_maj_apply_image_settings()
+    hardware_camera_maj_set_irfilter_off(s_CurrentMajesticCamSettings.uFlags & CAMERA_FLAG_IR_FILTER_OFF, false);
+ }
+ 
++// Hi3516CV610 + IMX335 on two MIPI lanes: the sensor profile sets the
++// capture window and frame rate, and video0.size may not exceed the window.
++// Picks the profile for the requested fps (5MP for <=30 fps above 1080p) and
++// returns the size to give majestic, clamped to the window.
++static void _hardware_camera_maj_cv610_select_sensor(int iFPS, int iWidth, int iHeight, int* piOutWidth, int* piOutHeight)
++{
++   const char* szIni = "imx335_2l_1080p60.ini";
++   int iMaxW = 1920, iMaxH = 1080;
++   if ( (iFPS <= 30) && ((iWidth > 1920) || (iHeight > 1080)) )
++   {
++      szIni = "imx335_i2c_5M.ini";
++      iMaxW = 2592; iMaxH = 1944;
++   }
++   else if ( iFPS <= 60 )
++      szIni = "imx335_2l_1080p60.ini";
++   else if ( iFPS <= 90 )
++      szIni = "imx335_2l_1080p90.ini";
++   else
++   {
++      // 1536x864 crop at 120 fps; 1280x720 is scaled from it (59% of the width).
++      szIni = "imx335_2l_864p120.ini";
++      iMaxW = 1536; iMaxH = 864;
++   }
++
++   *piOutWidth = iWidth;
++   *piOutHeight = iHeight;
++   if ( (iWidth > iMaxW) || (iHeight > iMaxH) )
++   {
++      *piOutWidth = iMaxW;
++      *piOutHeight = iMaxH;
++   }
++
++   char szComm[256];
++   snprintf(szComm, sizeof(szComm)/sizeof(szComm[0]), "cli -s .isp.sensorConfig /etc/sensors/%s", szIni);
++   log_line("[HwCamMajestic] CV610 IMX335: %d fps %dx%d -> %s, size %dx%d", iFPS, iWidth, iHeight, szIni, *piOutWidth, *piOutHeight);
++   _execute_maj_command_wait(szComm);
++}
++
+ void _hardware_camera_maj_set_all_params()
+ {
+    char szComm[128];
+@@ -718,7 +756,13 @@ void _hardware_camera_maj_set_all_params()
+    sprintf(szComm, "cli -s .video0.bitrate %u", s_uCurrentMajesticBitrate/1000);
+    _execute_maj_command_wait(szComm);
+ 
+-   sprintf(szComm, "cli -s .video0.size %dx%d", s_pCurrentMajesticModel->video_params.iVideoWidth, s_pCurrentMajesticModel->video_params.iVideoHeight);
++   int iMajWidth = s_pCurrentMajesticModel->video_params.iVideoWidth;
++   int iMajHeight = s_pCurrentMajesticModel->video_params.iVideoHeight;
++   if ( hardware_board_is_hisi_cv610(hardware_getBoardType()) && (s_pCurrentMajesticModel->getActiveCameraType() == CAMERA_TYPE_OPENIPC_IMX335) )
++      _hardware_camera_maj_cv610_select_sensor(s_pCurrentMajesticModel->video_params.iVideoFPS,
++         s_pCurrentMajesticModel->video_params.iVideoWidth, s_pCurrentMajesticModel->video_params.iVideoHeight,
++         &iMajWidth, &iMajHeight);
++   sprintf(szComm, "cli -s .video0.size %dx%d", iMajWidth, iMajHeight);
+    _execute_maj_command_wait(szComm);
+ 
+    s_iCurrentMajesticQPDelta = s_pCurrentMajesticModel->video_link_profiles[s_iCurrentMajesticVideoProfile].iIPQuantizationDelta;
+@@ -834,6 +878,11 @@ void _hardware_camera_maj_set_irfilter_off_sync()
+          _add_maj_command_to_queue_or_exec("gpio set 10", false);
+          _add_maj_command_to_queue_or_exec("gpio clear 11", false);
+       }
++      if ( hardware_board_is_hisi_cv610(hardware_getBoardType()) )
++      {
++         _add_maj_command_to_queue_or_exec("gpio set 1", false);
++         _add_maj_command_to_queue_or_exec("gpio clear 9", false);
++      }
+    }
+    else
+    {
+@@ -857,6 +906,11 @@ void _hardware_camera_maj_set_irfilter_off_sync()
+          _add_maj_command_to_queue_or_exec("gpio set 11", false);
+          _add_maj_command_to_queue_or_exec("gpio clear 10", false);
+       }
++      if ( hardware_board_is_hisi_cv610(hardware_getBoardType()) )
++      {
++         _add_maj_command_to_queue_or_exec("gpio set 9", false);
++         _add_maj_command_to_queue_or_exec("gpio clear 1", false);
++      }
+    }
+    }
+ }
+diff --git a/code/base/hardware_camera.cpp b/code/base/hardware_camera.cpp
+index 1f4d695..d4829c2 100644
+--- a/code/base/hardware_camera.cpp
++++ b/code/base/hardware_camera.cpp
+@@ -494,7 +494,9 @@ void hardware_camera_set_default_oipc_calibration(int iCameraType)
+    szMajComm[0] = 0;
+    log_line("[HardwareCamera] Set default calibration for camera type: %d (%s)", iCameraType, str_get_hardware_camera_type_string(iCameraType));
+ 
+-   if ( iCameraType == CAMERA_TYPE_OPENIPC_IMX335 )
++   if ( (iCameraType == CAMERA_TYPE_OPENIPC_IMX335) && hardware_board_is_hisi_cv610(hardware_getBoardType()) )
++      sprintf(szMajComm, "cli -s .isp.sensorConfig /etc/sensors/imx335_2l_1080p60.ini");
++   else if ( iCameraType == CAMERA_TYPE_OPENIPC_IMX335 )
+    {
+       if ( access("/etc/sensors/imx335_fpv.bin", R_OK) != -1 )
+          sprintf(szMajComm, "cli -s .isp.sensorConfig /etc/sensors/imx335_fpv.bin");
+diff --git a/code/base/models.cpp b/code/base/models.cpp
+index b88b6e8..0402b8e 100644
+--- a/code/base/models.cpp
++++ b/code/base/models.cpp
+@@ -2725,7 +2725,7 @@ void Model::resetVideoParamsToDefaults()
+    video_params.iVideoFPS = DEFAULT_VIDEO_FPS;
+    if ( hardware_board_is_openipc(hardware_getBoardType()) )
+       video_params.iVideoFPS = DEFAULT_VIDEO_FPS_OIPC;
+-   if ( hardware_board_is_sigmastar(hardware_getBoardType()) )
++   if ( hardware_board_is_sigmastar(hardware_getBoardType()) || hardware_board_is_hisi_cv610(hardware_getBoardType()) )
+       video_params.iVideoFPS = DEFAULT_VIDEO_FPS_OIPC_SIGMASTAR;
+ 
+    if ( hardware_isCameraVeye() || hardware_isCameraHDMI() )
+@@ -2819,7 +2819,7 @@ void Model::resetVideoLinkProfile(int iProfile)
+         ((hardware_getBoardType() & BOARD_TYPE_MASK) == BOARD_TYPE_PIZEROW) ||
+         hardware_board_is_goke(hardware_getBoardType()) )
+       video_link_profiles[iProfile].uTargetVideoBitrateBPS = DEFAULT_VIDEO_BITRATE_PI_ZERO;
+-   if ( hardware_board_is_sigmastar(hardware_getBoardType()) )
++   if ( hardware_board_is_sigmastar(hardware_getBoardType()) || hardware_board_is_hisi_cv610(hardware_getBoardType()) )
+       video_link_profiles[iProfile].uTargetVideoBitrateBPS = DEFAULT_VIDEO_BITRATE_OPIC_SIGMASTAR;
+ 
+    if ( iProfile == VIDEO_PROFILE_HIGH_QUALITY )
+@@ -4084,7 +4084,7 @@ bool Model::validate_settings()
+       video_params.iVideoFPS = DEFAULT_VIDEO_FPS;
+       if ( hardware_board_is_openipc(hardware_getBoardType()) )
+          video_params.iVideoFPS = DEFAULT_VIDEO_FPS_OIPC;
+-      if ( hardware_board_is_sigmastar(hardware_getBoardType()) )
++      if ( hardware_board_is_sigmastar(hardware_getBoardType()) || hardware_board_is_hisi_cv610(hardware_getBoardType()) )
+          video_params.iVideoFPS = DEFAULT_VIDEO_FPS_OIPC_SIGMASTAR;
+ 
+       if ( hardware_isCameraVeye() || hardware_isCameraHDMI() )
+@@ -4638,7 +4638,7 @@ void Model::resetHWCapabilities()
+    hwCapabilities.iMaxTxVideoBlockPackets = MAX_TOTAL_PACKETS_IN_BLOCK;
+    
+    hwCapabilities.uHWFlags = 0;
+-   if ( hardware_board_is_goke( hardware_getBoardType() ) )
++   if ( hardware_board_is_goke( hardware_getBoardType() ) || hardware_board_is_hisi_cv610( hardware_getBoardType() ) )
+       hwCapabilities.uHWFlags &= ~MODEL_HW_CAP_FLAG_OTA;
+    else
+       hwCapabilities.uHWFlags |= MODEL_HW_CAP_FLAG_OTA;
+@@ -6466,7 +6466,7 @@ void Model::setVideoProfilesDefaultVideoBitrates()
+       video_link_profiles[VIDEO_PROFILE_USER].uTargetVideoBitrateBPS = DEFAULT_VIDEO_BITRATE_PI_ZERO;
+       video_link_profiles[VIDEO_PROFILE_CUST].uTargetVideoBitrateBPS = DEFAULT_VIDEO_BITRATE_PI_ZERO;
+    }
+-   if ( hardware_board_is_sigmastar(hardware_getBoardType()) )
++   if ( hardware_board_is_sigmastar(hardware_getBoardType()) || hardware_board_is_hisi_cv610(hardware_getBoardType()) )
+    {
+       video_link_profiles[VIDEO_PROFILE_HIGH_QUALITY].uTargetVideoBitrateBPS = DEFAULT_VIDEO_BITRATE_OPIC_SIGMASTAR;
+       video_link_profiles[VIDEO_PROFILE_USER].uTargetVideoBitrateBPS = DEFAULT_VIDEO_BITRATE_OPIC_SIGMASTAR;
+diff --git a/code/common/string_utils.c b/code/common/string_utils.c
+index cb73a76..ca979c1 100644
+--- a/code/common/string_utils.c
++++ b/code/common/string_utils.c
+@@ -790,6 +790,7 @@ const char* str_get_hardware_board_name(u32 board_type)
+    static const char* s_szBoardTypeOpenIPCGoke200 = "OpenIPC Goke200";
+    static const char* s_szBoardTypeOpenIPCGoke210 = "OpenIPC Goke210";
+    static const char* s_szBoardTypeOpenIPCGoke300 = "OpenIPC Goke300";
++   static const char* s_szBoardTypeOpenIPCHisiCV610 = "OpenIPC HiSilicon CV610";
+    static const char* s_szBoardTypeOpenIPCSigmasterGeneric = "OpenIPC SSC338Q Generic";
+    static const char* s_szBoardTypeOpenIPCSigmasterGeneric30KQ = "OpenIPC SSC30KQ Generic";
+    static const char* s_szBoardTypeOpenIPCSigmasterUltrasight = "Ultrasight AIO";
+@@ -835,6 +836,8 @@ const char* str_get_hardware_board_name(u32 board_type)
+       return s_szBoardTypeOpenIPCGoke210;
+    if ( (board_type & BOARD_TYPE_MASK) == BOARD_TYPE_OPENIPC_GOKE300 )
+       return s_szBoardTypeOpenIPCGoke300;
++   if ( (board_type & BOARD_TYPE_MASK) == BOARD_TYPE_OPENIPC_HISI_CV610 )
++      return s_szBoardTypeOpenIPCHisiCV610;
+    if ( (board_type & BOARD_TYPE_MASK) == BOARD_TYPE_OPENIPC_SIGMASTAR_338Q )
+    {
+       switch ( (board_type & BOARD_SUBTYPE_MASK) >> BOARD_SUBTYPE_SHIFT )
+@@ -876,6 +879,7 @@ const char* str_get_hardware_board_name_short(u32 board_type)
+    static const char* s_szBoardSTypeOpenIPCGoke200 = "Goke200";
+    static const char* s_szBoardSTypeOpenIPCGoke210 = "Goke210";
+    static const char* s_szBoardSTypeOpenIPCGoke300 = "Goke300";
++   static const char* s_szBoardSTypeOpenIPCHisiCV610 = "CV610";
+    static const char* s_szBoardSTypeOpenIPCSigmasterGeneric = "SSC338Q";
+    static const char* s_szBoardSTypeOpenIPCSigmasterGeneric30KQ = "SSC30KQ";
+    static const char* s_szBoardSTypeOpenIPCSigmasterUltrasight = "Ultrasight";
+@@ -919,6 +923,8 @@ const char* str_get_hardware_board_name_short(u32 board_type)
+       return s_szBoardSTypeOpenIPCGoke210;
+    if ( (board_type & BOARD_TYPE_MASK) == BOARD_TYPE_OPENIPC_GOKE300 )
+       return s_szBoardSTypeOpenIPCGoke300;
++   if ( (board_type & BOARD_TYPE_MASK) == BOARD_TYPE_OPENIPC_HISI_CV610 )
++      return s_szBoardSTypeOpenIPCHisiCV610;
+    if ( (board_type & BOARD_TYPE_MASK) == BOARD_TYPE_OPENIPC_SIGMASTAR_338Q )
+    {
+       switch ( (board_type & BOARD_SUBTYPE_MASK) >> BOARD_SUBTYPE_SHIFT)
+diff --git a/code/r_utils/ruby_update.cpp b/code/r_utils/ruby_update.cpp
+index d896a19..dac2080 100644
+--- a/code/r_utils/ruby_update.cpp
++++ b/code/r_utils/ruby_update.cpp
+@@ -391,7 +391,7 @@ void do_update_to_113()
+    pModel->video_params.iVideoFPS = DEFAULT_VIDEO_FPS;
+    #if defined (HW_PLATFORM_OPENIPC_CAMERA)
+    pModel->video_params.iVideoFPS = DEFAULT_VIDEO_FPS_OIPC;
+-   if ( hardware_board_is_sigmastar(hardware_getBoardType()) )
++   if ( hardware_board_is_sigmastar(hardware_getBoardType()) || hardware_board_is_hisi_cv610(hardware_getBoardType()) )
+       pModel->video_params.iVideoFPS = DEFAULT_VIDEO_FPS_OIPC_SIGMASTAR;
+    #endif
+ 
+@@ -498,7 +498,7 @@ void do_update_to_112()
+    pModel->video_params.iVideoFPS = DEFAULT_VIDEO_FPS;
+    if ( hardware_board_is_openipc(hardware_getBoardType()) )
+       pModel->video_params.iVideoFPS = DEFAULT_VIDEO_FPS_OIPC;
+-   if ( hardware_board_is_sigmastar(hardware_getBoardType()) )
++   if ( hardware_board_is_sigmastar(hardware_getBoardType()) || hardware_board_is_hisi_cv610(hardware_getBoardType()) )
+       pModel->video_params.iVideoFPS = DEFAULT_VIDEO_FPS_OIPC_SIGMASTAR;
+ 
+    if ( hardware_isCameraVeye() || hardware_isCameraHDMI() )

@@ -1,0 +1,32 @@
+From: cv610-fpv
+Subject: [PATCH] OpenIPC: Serial-0 device name from /etc/ruby_serial_port
+
+Ruby takes /dev/ttyAMA0 for flight-controller telemetry on OpenIPC
+cameras. On a camera whose first UART is wired to something else (the
+H5SVX zoom lens module), an image can name another device in
+/etc/ruby_serial_port. Without the file nothing changes.
+---
+--- a/code/base/hardware_serial.c
++++ b/code/base/hardware_serial.c
+@@ -84,6 +84,21 @@
+    strcpy(s_HardwareSerialPortsInfo[0].szPortDeviceName, "/dev/ttyAMA0");
+    if ( (hardware_getBoardType() & BOARD_TYPE_MASK) == BOARD_TYPE_OPENIPC_SIGMASTAR_338Q )
+       strcpy(s_HardwareSerialPortsInfo[0].szPortDeviceName, "/dev/ttyS0");
++   // An image can name another device for Serial-0 in /etc/ruby_serial_port
++   // (one line, e.g. /dev/ttyAMA2), for a camera whose first UART is taken
++   // by something else. Without the file, or if the device is not there,
++   // nothing changes.
++   {
++      FILE* fdPort = fopen("/etc/ruby_serial_port", "r");
++      if ( NULL != fdPort )
++      {
++         char szPort[64];
++         szPort[0] = 0;
++         if ( (1 == fscanf(fdPort, "%63s", szPort)) && (0 == strncmp(szPort, "/dev/", 5)) && (access(szPort, R_OK) != -1) )
++            strcpy(s_HardwareSerialPortsInfo[0].szPortDeviceName, szPort);
++         fclose(fdPort);
++      }
++   }
+    s_HardwareSerialPortsInfo[0].iSupported = 1;
+    s_HardwareSerialPortsInfo[0].lPortSpeed = DEFAULT_FC_TELEMETRY_SERIAL_SPEED;
+    s_HardwareSerialPortsInfo[0].iPortUsage = SERIAL_PORT_USAGE_NONE;

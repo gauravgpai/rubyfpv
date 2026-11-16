@@ -1,0 +1,41 @@
+#!/bin/sh
+#
+# Two-camera stream switch (see /etc/camswitch.conf). Must run before Ruby
+# starts majestic, which sends its video to the switch in this image.
+#
+
+# majestic keeps a list of output addresses (outgoing.servers) and adds every
+# new outgoing.server to it instead of replacing. Drop the list at boot so
+# only the address set afterwards is used.
+clear_outputs() {
+	y=/etc/majestic.yaml
+	[ -f "$y" ] || return 0
+	awk '/^  servers:[ \t]*$/ { skip = 1; next }
+	     skip && (/^  - / || /^    /) { next }
+	     { skip = 0; print }' "$y" > /tmp/majestic.yaml.new || return 0
+	if ! cmp -s "$y" /tmp/majestic.yaml.new; then
+		cat /tmp/majestic.yaml.new > "$y"
+		logger -t camvideo "cleared majestic's list of output addresses"
+	fi
+	rm -f /tmp/majestic.yaml.new
+}
+
+case "$1" in
+	start)
+		# Ruby sets outgoing.server to the switch (127.0.0.1:5602) when it
+		# starts majestic; an older entry for 127.0.0.1:5600 must not stay.
+		clear_outputs
+		cli -s .outgoing.server udp://127.0.0.1:5602 2>/dev/null
+		start-stop-daemon -S -b -q -x /usr/sbin/camswitch
+		;;
+	stop)
+		start-stop-daemon -K -q -x /usr/sbin/camswitch
+		;;
+	restart)
+		"$0" stop; sleep 1; "$0" start
+		;;
+	*)
+		echo "Usage: $0 {start|stop|restart}"
+		exit 1
+		;;
+esac

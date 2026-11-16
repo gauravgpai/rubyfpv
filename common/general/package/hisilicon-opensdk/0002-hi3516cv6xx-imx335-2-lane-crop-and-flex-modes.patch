@@ -1,0 +1,190 @@
+From: cv610-fpv
+Subject: [PATCH] hi3516cv6xx imx335: 2-lane crop and flex modes up to 1080p100 / 864p120
+
+On top of 0001 (2-lane mode 0). The 1080p crop table, which the flex
+window-crop mode (Isp_SnsMode=5) replays, was a 4-lane table at 594 Mbit/s;
+it now carries the stock-firmware 2-lane INCK/analog block with SYS_MODE
+0x01 (1188 Mbit/s per lane) and LANEMODE 2.
+
+Two limits set the shortest usable line, both measured on a Hi3516CV610-20S
++ IMX335 2-lane board:
+ - lane bandwidth: a RAW10 row of HNUM pixels within 2H on two lanes; at
+   1080p HMAX 308 truncates frames, 317 is clean (5% margin kept);
+ - the sensor minimum line 0x113: 1536x864 at HMAX 269 comes out streaked.
+Rates above that floor are refused in cmos_isp_set_image_mode() and
+cmos_fps_set() instead of streaming broken frames.
+
+Flex VMAX now follows the window (it was held at the 1080p table's
+0x08F8), so windows under 1080 lines can reach 120 fps on two lanes.
+
+Verified: 1080p60/90/100 and 1536x864@120, no MIPI CRC/ECC errors, clean
+image, full rate at VPSS and in the H.265 RTP output (waybeam and majestic).
+1080p110 is refused (limit ~101 fps).
+
+--- a/libraries/sensor/hi3516cv6xx/sony_imx335/imx335_cfg.h
++++ b/libraries/sensor/hi3516cv6xx/sony_imx335/imx335_cfg.h
+@@ -106,41 +106,41 @@
+ };
+ 
+ /*
+- * 1920x1080 @ up to 90 fps, 10-bit linear, 4-lane cropped readout.
+- * Extracted from the OpenIPC ev200 driver's IMX335_cropped_60fps_1080p_init()
+- * (WINMODE=0x04, HNUM=0x0798, VMAX=0x08F8, HMAX=0x016E, SYS_MODE=0x02).
+- * SensorReset()/start writes are issued by imx335_reg_init(); the SHR0/GAIN
+- * values at the end give a valid first frame before AE takes over.
++ * 1920x1080 cropped readout, 10-bit linear, 2-lane (LANEMODE 0x3A01=1, MIPI
++ * PHY lanes 0/2), INCK 24 MHz, 1188 Mbit/s per lane. The INCK/analog block is
++ * the stock-firmware 2-lane table of mode 0, including SYS_MODE 0x01 (its
++ * power-on value; 0x00 and 0x02 run the line clock at 2/3). The window
++ * registers (WINMODE=0x04, HTRIM/HNUM, Y_OUT, AREA3, OB) are the ev200
++ * driver's 1080p crop; VMAX=0x08F8 and HMAX=0x016E give ~88 fps. The flex
++ * mode replays this table and overrides the window, VMAX and HMAX.
+  */
+ static cis_reg_cfg imx335_1080p_crop_10bit[] = {
+-    {0x300C, 0x5B},    {0x300D, 0x40},    {0x3018, 0x04},    {0x302C, 0x80},
++    {0x300C, 0x3B},    {0x300D, 0x2A},    {0x3018, 0x04},    {0x302C, 0x80},
+     {0x302D, 0x01},    {0x302E, 0x98},    {0x302F, 0x07},    {0x3030, 0xF8},
+     {0x3031, 0x08},    {0x3032, 0x00},    {0x3034, 0x6E},    {0x3035, 0x01},
+     {0x3056, 0x4C},    {0x3057, 0x04},    {0x3072, 0x28},    {0x3073, 0x00},
+     {0x3074, 0x10},    {0x3075, 0x04},    {0x3076, 0x98},    {0x3077, 0x08},
+     {0x3050, 0x00},    {0x30C6, 0x12},    {0x30CE, 0x64},    {0x30D8, 0x78},
+-    {0x30D9, 0x0D},    {0x314C, 0xC0},    {0x315A, 0x06},    {0x316A, 0x7E},
+-    {0x319D, 0x00},    {0x319E, 0x02},    {0x31A1, 0x00},    {0x3288, 0x21},
+-    {0x328A, 0x02},    {0x3414, 0x05},    {0x3416, 0x18},    {0x341C, 0xFF},
+-    {0x341D, 0x01},    {0x3648, 0x01},    {0x364A, 0x04},    {0x364C, 0x04},
+-    {0x3678, 0x01},    {0x367C, 0x31},    {0x367E, 0x31},    {0x3706, 0x10},
+-    {0x3708, 0x03},    {0x3714, 0x02},    {0x3715, 0x02},    {0x3716, 0x01},
+-    {0x3717, 0x03},    {0x371C, 0x3D},    {0x371D, 0x3F},    {0x372C, 0x00},
+-    {0x372D, 0x00},    {0x372E, 0x46},    {0x372F, 0x00},    {0x3730, 0x89},
+-    {0x3731, 0x00},    {0x3732, 0x08},    {0x3733, 0x01},    {0x3734, 0xFE},
+-    {0x3735, 0x05},    {0x3740, 0x02},    {0x375D, 0x00},    {0x375E, 0x00},
+-    {0x375F, 0x11},    {0x3760, 0x01},    {0x3768, 0x1B},    {0x3769, 0x1B},
+-    {0x376A, 0x1B},    {0x376B, 0x1B},    {0x376C, 0x1A},    {0x376D, 0x17},
+-    {0x376E, 0x0F},    {0x3776, 0x00},    {0x3777, 0x00},    {0x3778, 0x46},
+-    {0x3779, 0x00},    {0x377A, 0x89},    {0x377B, 0x00},    {0x377C, 0x08},
+-    {0x377D, 0x01},    {0x377E, 0x23},    {0x377F, 0x02},    {0x3780, 0xD9},
+-    {0x3781, 0x03},    {0x3782, 0xF5},    {0x3783, 0x06},    {0x3784, 0xA5},
+-    {0x3788, 0x0F},    {0x378A, 0xD9},    {0x378B, 0x03},    {0x378C, 0xEB},
+-    {0x378D, 0x05},    {0x378E, 0x87},    {0x378F, 0x06},    {0x3790, 0xF5},
+-    {0x3792, 0x43},    {0x3794, 0x7A},    {0x3796, 0xA1},    {0x3A18, 0x7F},
+-    {0x3A1A, 0x37},    {0x3A1C, 0x37},    {0x3A1E, 0xF7},    {0x3A1F, 0x00},
+-    {0x3A20, 0x3F},    {0x3A22, 0x6F},    {0x3A24, 0x3F},    {0x3A26, 0x5F},
+-    {0x3A28, 0x2F},
++    {0x30D9, 0x0D},    {0x314C, 0xC6},    {0x314D, 0x00},    {0x315A, 0x02},
++    {0x3168, 0xA0},    {0x316A, 0x7E},    {0x319D, 0x00},    {0x319E, 0x01},
++    {0x31A1, 0x00},    {0x3288, 0x21},    {0x328A, 0x02},    {0x3414, 0x05},
++    {0x3416, 0x18},    {0x341C, 0xFF},    {0x341D, 0x01},    {0x3648, 0x01},
++    {0x364A, 0x04},    {0x364C, 0x04},    {0x3678, 0x01},    {0x367C, 0x31},
++    {0x367E, 0x31},    {0x3706, 0x10},    {0x3708, 0x03},    {0x3714, 0x02},
++    {0x3715, 0x02},    {0x3716, 0x01},    {0x3717, 0x03},    {0x371C, 0x3D},
++    {0x371D, 0x3F},    {0x372C, 0x00},    {0x372D, 0x00},    {0x372E, 0x46},
++    {0x372F, 0x00},    {0x3730, 0x89},    {0x3731, 0x00},    {0x3732, 0x08},
++    {0x3733, 0x01},    {0x3734, 0xFE},    {0x3735, 0x05},    {0x3740, 0x02},
++    {0x375D, 0x00},    {0x375E, 0x00},    {0x375F, 0x11},    {0x3760, 0x01},
++    {0x3768, 0x1A},    {0x3769, 0x1A},    {0x376A, 0x1A},    {0x376B, 0x1A},
++    {0x376C, 0x1A},    {0x376D, 0x17},    {0x376E, 0x0F},    {0x3776, 0x00},
++    {0x3777, 0x00},    {0x3778, 0x46},    {0x3779, 0x00},    {0x377A, 0x89},
++    {0x377B, 0x00},    {0x377C, 0x08},    {0x377D, 0x01},    {0x377E, 0x23},
++    {0x377F, 0x02},    {0x3780, 0xD9},    {0x3781, 0x03},    {0x3782, 0xF5},
++    {0x3783, 0x06},    {0x3784, 0xA5},    {0x3788, 0x0F},    {0x378A, 0xD9},
++    {0x378B, 0x03},    {0x378C, 0xEB},    {0x378D, 0x05},    {0x378E, 0x87},
++    {0x378F, 0x06},    {0x3790, 0xF5},    {0x3792, 0x43},    {0x3794, 0x7A},
++    {0x3796, 0xA1},    {0x3A01, 0x01},
+     /* Initial exposure (~500 lines), 1x gain. */
+     {0x3058, 0x04},    {0x3059, 0x07},    {0x305A, 0x00},
+     {0x30E8, 0x00},    {0x30E9, 0x00},
+--- a/libraries/sensor/hi3516cv6xx/sony_imx335/imx335_cmos.h
++++ b/libraries/sensor/hi3516cv6xx/sony_imx335/imx335_cmos.h
+@@ -115,15 +115,36 @@
+ #define IMX335_FLEX_VMAX_BASE      (0x08F8)
+ #define IMX335_FLEX_HMAX_MIN       64
+ #define IMX335_FLEX_HMAX_MAX       8191
++/* Shortest usable line (HMAX) for a window of HNUM pixels on this board.
++ * Two limits, measured on the bench:
++ *  - the two MIPI lanes at 1188 Mbit/s must carry a RAW10 row of HNUM pixels
++ *    within 2H: HMAX >= FLEX_CLK * HNUM * 10 / (2 * lanes * rate), plus
++ *    packet overhead. At HNUM 1944 the bare figure is 304; 308 truncates
++ *    frames, 317 is clean, so 5% is allowed for the overhead;
++ *  - the sensor's own minimum line, 0x113 (the floor of the 4-lane 120/144
++ *    fps tables): 1536x864 at HMAX 269 has room on the link but comes out
++ *    streaked.
++ * 1080p therefore tops out at ~101 fps; 1536x864 reaches 120 at HMAX 332. */
++#define IMX335_MIPI_LANES          2
++#define IMX335_MIPI_MBPS           1188
++#define IMX335_ROW_MARGIN_PCT      105
++#define IMX335_HMAX_MIN_AD         275
++#define IMX335_HMAX_LANES(hnum) \
++    ((td_u32)(((td_u64)IMX335_FLEX_CLK * (hnum) * 10 * IMX335_ROW_MARGIN_PCT + \
++    (td_u64)2 * IMX335_MIPI_LANES * IMX335_MIPI_MBPS * 1000000 * 100 - 1) / \
++    ((td_u64)2 * IMX335_MIPI_LANES * IMX335_MIPI_MBPS * 1000000 * 100)))
++#define IMX335_HMAX_FLOOR(hnum) \
++    ((IMX335_HMAX_LANES(hnum) > IMX335_HMAX_MIN_AD) ? IMX335_HMAX_LANES(hnum) : IMX335_HMAX_MIN_AD)
+ #define IMX335_CROP_W_DEFAULT      1920
+ #define IMX335_CROP_H_DEFAULT      1080
+ #define IMX335_FPS_MAX_FLEX        240
+ #define IMX335_FPS_MIN_FLEX        2.0
+ /* Flex VMAX for a crop height: the window's own frame length, which the T6 VI
+- * requires to stay put. */
+-#define IMX335_FLEX_VMAX(crop_h) \
+-    (((((crop_h) + 20) * 2 + 96) > IMX335_FLEX_VMAX_BASE) ? \
+-     (((crop_h) + 20) * 2 + 96) : IMX335_FLEX_VMAX_BASE)
++ * requires to stay put. It used to be held at or above the 1080p table's
++ * 0x08F8; on two lanes that left windows under 1080 lines no way to 120 fps
++ * (HMAX would have to go below the sensor minimum), so they now run at their
++ * own, shorter length (1536x864: 1864). */
++#define IMX335_FLEX_VMAX(crop_h) (((crop_h) + 20) * 2 + 96)
+ /* Slowest rate the 13-bit HMAX can express at a given fixed VMAX. */
+ #define IMX335_FLEX_MIN_FPS(vmax) \
+     ((td_float)IMX335_FLEX_CLK / ((td_float)IMX335_FLEX_HMAX_MAX * (td_float)(vmax)))
+--- a/libraries/sensor/hi3516cv6xx/sony_imx335/imx335_cmos.c
++++ b/libraries/sensor/hi3516cv6xx/sony_imx335/imx335_cmos.c
+@@ -467,6 +467,18 @@
+         if (hmax < IMX335_FLEX_HMAX_MIN) {
+             hmax = IMX335_FLEX_HMAX_MIN;
+         }
++        {
++            td_u32 crop_w = IMX335_WIDTH_CROP;
++
++            if (sns_state->img_mode == IMX335_CROP_FLEX_LINEAR_MODE) {
++                imx335_get_crop(vi_pipe, &crop_w, TD_NULL);
++            }
++            if (hmax < IMX335_HMAX_FLOOR(crop_w + 24)) {
++                isp_err_trace("imx335 crop: fps %f needs HMAX %u < 2-lane floor %u\n",
++                    fps, hmax, IMX335_HMAX_FLOOR(crop_w + 24));
++                return;
++            }
++        }
+         imx335_set_crop_hmax(vi_pipe, hmax);
+         if (cis->i2c.fd >= 0) {
+             imx335_config_hmax(cis, hmax);
+@@ -1190,6 +1202,16 @@
+                     sns_image_mode->fps, min_fps, crop_w, crop_h);
+                 return TD_FAILURE;
+             }
++            /* Nor one faster than the line-time floor allows at this width. */
++            if ((td_float)IMX335_FLEX_CLK / (sns_image_mode->fps * (td_float)vmax) <
++                (td_float)IMX335_HMAX_FLOOR(crop_w + 24)) {
++                isp_err_trace("imx335 flex: fps %f above the 2-lane limit %f for %ux%u\n",
++                    sns_image_mode->fps,
++                    (td_float)IMX335_FLEX_CLK /
++                    ((td_float)IMX335_HMAX_FLOOR(crop_w + 24) * (td_float)vmax),
++                    crop_w, crop_h);
++                return TD_FAILURE;
++            }
+         }
+         imx335_get_crop(vi_pipe, &old_w, &old_h);
+         old_fps = imx335_get_flex_fps(vi_pipe);
+--- a/libraries/sensor/hi3516cv6xx/sony_imx335/imx335_sensor_ctrl.c
++++ b/libraries/sensor/hi3516cv6xx/sony_imx335/imx335_sensor_ctrl.c
+@@ -133,6 +133,11 @@
+     fps = imx335_get_flex_fps(cis->pipe);
+     hmax = (td_u32)((td_float)IMX335_FLEX_CLK / (fps * (td_float)vmax) + 0.5f);
+     hmax = clip3(hmax, IMX335_FLEX_HMAX_MIN, IMX335_FLEX_HMAX_MAX);
++    /* cmos_isp_set_image_mode() refuses rates above the line-time floor;
++     * keep the line at least that long regardless. */
++    if (hmax < IMX335_HMAX_FLOOR(hnum)) {
++        hmax = IMX335_HMAX_FLOOR(hnum);
++    }
+ 
+     if (imx335_reset(cis) != TD_SUCCESS) {
+         return TD_FAILURE;

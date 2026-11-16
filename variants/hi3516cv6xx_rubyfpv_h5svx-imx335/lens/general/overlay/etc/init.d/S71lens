@@ -1,0 +1,52 @@
+#!/bin/sh
+#
+# "lens" variant: the camera's only wired UART (UART0, ttyAMA0) belongs to the
+# zoom/focus lens module, so flight-controller telemetry for Ruby comes in on
+# UART2 (ttyAMA2), whose RXD is switched onto the alarm-input pad here.
+#
+# Runs after S70vendor (the vendor pin setup) and before S73ruby.
+#
+#   pad register   default        UART2 function
+#   0x11130000     GPIO1_5 (13)   3 = UART2_RXD   alarm input      (UART2_RX=alarm)
+#   0x1113004C     GPIO7_6 (62)   5 = UART2_TXD   reset button pad (UART2_TX=reset)
+#
+# Only the function field (low 4 bits) is changed; drive and pull bits stay.
+#
+
+[ -f /etc/lens.conf ] && . /etc/lens.conf
+
+mux() {	# mux <register> <function> <name>
+	old=$(devmem "$1")
+	new=$(printf '0x%08X' $(( (old & ~0xF) | $2 )))
+	devmem "$1" 32 "$new"
+	logger -t lens "$3: pad $1 $old -> $(devmem "$1")"
+}
+
+case "$1" in
+	start)
+		[ "${UART2_RX:-alarm}" = alarm ] && mux 0x11130000 3 "UART2 RXD on the alarm input"
+		[ "${UART2_TX:-none}" = reset ] && mux 0x1113004C 5 "UART2 TXD on the reset button pad"
+
+		# The lens port: raw, at the module's speed. Nothing else may use
+		# it (this image has no login prompt on the serial console).
+		stty -F "${LENS_PORT:-/dev/ttyAMA0}" "${LENS_BAUD:-57600}" raw -echo 2>/dev/null
+		# Open as the stock firmware does (query + version request).
+		/usr/sbin/lens init
+
+		# Autofocus: feed the lens board the picture's sharpness 30 times
+		# a second (it does the focusing). Waits by itself until majestic
+		# has the video pipeline up.
+		if [ "${LENS_AF:-1}" = 1 ] && [ -x /usr/sbin/lensaf ]; then
+			start-stop-daemon -S -b -q -x /usr/sbin/lensaf -- -p "${LENS_PORT:-/dev/ttyAMA0}"
+		fi
+		;;
+
+	stop)
+		start-stop-daemon -K -q -x /usr/sbin/lensaf 2>/dev/null
+		;;
+
+	*)
+		echo "Usage: $0 {start|stop}"
+		exit 1
+		;;
+esac

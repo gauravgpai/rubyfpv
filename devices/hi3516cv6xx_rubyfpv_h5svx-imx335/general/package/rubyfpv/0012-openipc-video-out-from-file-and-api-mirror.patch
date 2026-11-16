@@ -1,0 +1,79 @@
+From: cv610-fpv
+Subject: [PATCH] OpenIPC: majestic output address from /etc/ruby_video_out
+
+For a two-camera setup a stream switch sits between majestic and Ruby. The
+image names the address majestic sends to in /etc/ruby_video_out (one line,
+udp://host:port); Ruby still reads 127.0.0.1:5600. With the file present,
+the majestic API requests Ruby makes at run time (bitrate, GOP, QP, picture
+controls) are also sent as datagrams to 127.0.0.1:5606, so the switch can
+repeat them to the second camera, and picture controls (image.*,
+isp.exposure) are not applied locally while the switch shows the second
+camera (/tmp/camswitch.remote). Without the file nothing changes.
+---
+--- a/code/base/hardware_cam_maj.cpp
++++ b/code/base/hardware_cam_maj.cpp
+@@ -136,6 +136,32 @@
+ 
+    snprintf(szRequest, sizeof(szRequest)/sizeof(szRequest[0]), "GET %s HTTP/1.0\r\n\r\n", szTmp);
+ 
++   // With a stream switch in place, tell it about run-time majestic changes
++   // (UDP 127.0.0.1:5606) so a second camera can follow them. Picture
++   // controls (image.*, isp.exposure) act on the camera being shown: while
++   // the switch shows the second camera (/tmp/camswitch.remote exists) they
++   // are not applied to the local majestic.
++   if ( access("/etc/ruby_video_out", R_OK) == 0 )
++   {
++      int iMirror = socket(AF_INET, SOCK_DGRAM, 0);
++      if ( iMirror >= 0 )
++      {
++         struct sockaddr_in addrMirror;
++         memset(&addrMirror, 0, sizeof(addrMirror));
++         addrMirror.sin_family = AF_INET;
++         addrMirror.sin_port = htons(5606);
++         addrMirror.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
++         sendto(iMirror, szTmp, strlen(szTmp), 0, (struct sockaddr*)&addrMirror, sizeof(addrMirror));
++         close(iMirror);
++      }
++      if ( ((NULL != strstr(szTmp, "?image.")) || (NULL != strstr(szTmp, "?isp.exposure"))) &&
++           (access("/tmp/camswitch.remote", F_OK) == 0) )
++      {
++         close(iSock);
++         return 0;
++      }
++   }
++
+    iRes = send(iSock, szRequest, strlen(szRequest), 0);
+    if ( iRes < 0 )
+    {
+@@ -791,7 +817,30 @@
+    _execute_maj_command_wait(szComm);
+ 
+    _execute_maj_command_wait("cli -s .outgoing.enabled true");
+-   _execute_maj_command_wait("cli -s .outgoing.server udp://127.0.0.1:5600");
++   {
++      // An image may put a stream switch between majestic and Ruby: it names
++      // the address majestic sends to in /etc/ruby_video_out.
++      char szOut[128];
++      char szOutComm[200];
++      strcpy(szOut, "udp://127.0.0.1:5600");
++      FILE* fdOut = fopen("/etc/ruby_video_out", "r");
++      if ( NULL != fdOut )
++      {
++         char szLine[128];
++         szLine[0] = 0;
++         if ( NULL != fgets(szLine, sizeof(szLine), fdOut) )
++         {
++            int n = strlen(szLine);
++            while ( (n > 0) && ((szLine[n-1] == '\n') || (szLine[n-1] == '\r') || (szLine[n-1] == ' ')) )
++               szLine[--n] = 0;
++            if ( 0 == strncmp(szLine, "udp://", 6) )
++               strcpy(szOut, szLine);
++         }
++         fclose(fdOut);
++      }
++      snprintf(szOutComm, sizeof(szOutComm), "cli -s .outgoing.server %s", szOut);
++      _execute_maj_command_wait(szOutComm);
++   }
+ 
+    // Allow room for video header important and 5 bytes for NAL header
+    int iNALSize = s_pCurrentMajesticModel->video_link_profiles[s_iCurrentMajesticVideoProfile].video_data_length;

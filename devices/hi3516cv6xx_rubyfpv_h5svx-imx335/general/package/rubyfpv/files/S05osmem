@@ -1,0 +1,48 @@
+#!/bin/sh
+#
+# Give Linux 64 MB of the CV610's 128 MB instead of the kernel's default 32 MB.
+#
+# With a USB Wi-Fi adapter (8812eu driver) plus Ruby, 32 MB runs out while the
+# radio comes up: the OOM killer takes ruby_rt_vehicle, or the kernel panics
+# ("System is deadlocked on memory") and the camera reboot-loops. The video
+# side (majestic, IMX335) uses about 35 MB of the media zone, so 64 MB for the
+# zone still leaves room.
+#
+# The kernel lays memory out itself and ignores mem=; it takes osmem=<size> on
+# the command line, which the U-Boot environment's ${extras} feeds. If that is
+# missing, add it and reboot once so it applies before Ruby and the radio start.
+# To go back to 32 MB: fw_setenv extras osmem=32M (anything with osmem= in it
+# is left alone).
+#
+
+OSMEM=64M
+params=/sys/module/hisi_mem/parameters
+
+case "$1" in
+	start)
+		# only on a kernel that published its layout, with 128 MB or more
+		dram=$(cat $params/dram 2>/dev/null)
+		[ -n "$dram" ] && [ "$dram" -ge 128 ] || exit 0
+
+		extras=$(fw_printenv -n extras 2>/dev/null)
+		case " $extras " in
+			*" osmem="*) exit 0 ;;
+		esac
+
+		new=$(echo "$extras osmem=$OSMEM" | sed 's/^ *//')
+		fw_setenv extras "$new" || exit 0
+		[ "$(fw_printenv -n extras 2>/dev/null)" = "$new" ] || exit 0
+		echo "osmem: OS memory set to $OSMEM in the U-Boot environment, rebooting once"
+		sync
+		reboot
+		sleep 30
+		;;
+
+	stop)
+		;;
+
+	*)
+		echo "Usage: $0 {start|stop}"
+		exit 1
+		;;
+esac

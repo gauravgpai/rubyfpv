@@ -1,0 +1,8 @@
+# built images and downloads are not kept in the repository
+firmware/
+*.bin
+*.squashfs
+*.tgz
+*.zip
+*.so
+build.log

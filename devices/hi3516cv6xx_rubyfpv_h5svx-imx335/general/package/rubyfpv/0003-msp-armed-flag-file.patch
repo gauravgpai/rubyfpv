@@ -1,0 +1,55 @@
+From: cv610-fpv
+Subject: [PATCH] MSP: keep the armed flag file
+
+The MAVLink parser touches /tmp/ruby/tmp/armed on arming and removes it on
+disarming; the MSP parser only set the telemetry flags. Keep the file for
+MSP flight controllers (Betaflight, INAV) too, so the SD card recorder
+(armrec) and r_start radio silence failsafe see arming. Camera-only code.
+---
+diff --git a/code/r_vehicle/telemetry_msp.cpp b/code/r_vehicle/telemetry_msp.cpp
+index f1b0fd5..492c056 100644
+--- a/code/r_vehicle/telemetry_msp.cpp
++++ b/code/r_vehicle/telemetry_msp.cpp
+@@ -70,6 +70,33 @@ bool s_bMSPSentOSDCanvasSize = false;
+ 
+ u32 s_uMSPLastRequestBatteryInfoTime = 0;
+ 
++// Keep the same armed flag file the MAVLink parser keeps (FOLDER_RUBY_TEMP
++// FILE_TEMP_ARMED), so programs on the camera that act on arming (the SD card
++// recorder, r_start's radio silence failsafe) also work with MSP flight controllers.
++static int s_iMSPArmedFileState = -1;
++
++static void _msp_update_armed_file(bool bArmed)
++{
++   int iState = bArmed ? 1 : 0;
++   if ( iState == s_iMSPArmedFileState )
++      return;
++   s_iMSPArmedFileState = iState;
++
++   char szFile[MAX_FILE_PATH_SIZE];
++   snprintf(szFile, sizeof(szFile)/sizeof(szFile[0]), "%s%s", FOLDER_RUBY_TEMP, FILE_TEMP_ARMED);
++   if ( bArmed )
++   {
++      FILE* fd = fopen(szFile, "wb");
++      if ( NULL != fd )
++         fclose(fd);
++      else
++         log_softerror_and_alarm("[MSP] Failed to create armed flag file %s", szFile);
++   }
++   else
++      unlink(szFile);
++   log_line("[MSP] FC is now %s.", bArmed ? "armed" : "disarmed");
++}
++
+ void _send_msp_to_fc(u8 uCommand, u8* pData, int iDataLength)
+ {
+    if ( telemetry_get_serial_port_file() <= 0 )
+@@ -416,6 +443,8 @@ void _parse_msp_command()
+ 
+              if ( g_pCurrentModel->telemetry_params.flags & TELEMETRY_FLAGS_FORCE_ARMED )
+                 pFCTelem->flight_mode |= FLIGHT_MODE_ARMED;
++
++             _msp_update_armed_file((pFCTelem->flight_mode & FLIGHT_MODE_ARMED) ? true : false);
+           }
+        }
+        break;

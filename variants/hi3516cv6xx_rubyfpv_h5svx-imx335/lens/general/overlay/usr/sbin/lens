@@ -1,0 +1,56 @@
+#!/bin/sh
+#
+# lens - zoom and focus of the UART lens module (Pelco-D).
+#
+#   lens zoom-in | zoom-out | focus-near | focus-far [milliseconds]
+#   lens stop
+#   lens init     the stock firmware's opening query (sent once at boot)
+#
+# A move runs until "stop". With a time (10..5000 ms) the stop is sent after
+# it. Settings: /etc/lens.conf (LENS_PORT, LENS_BAUD, LENS_ADDR).
+#
+# Frame: FF addr cmd1 cmd2 data1 data2 checksum, the checksum being the sum of
+# the five bytes after FF, modulo 256.
+#
+# Verified on the module itself (camera sending at 57600, Pelco-D alone):
+# zoom and focus both moved. The stock firmware also feeds the module an image
+# sharpness frame 30 times a second for its autofocus; this tool does not.
+#
+
+LENS_PORT=/dev/ttyAMA0
+LENS_BAUD=57600
+LENS_ADDR=1
+[ -f /etc/lens.conf ] && . /etc/lens.conf
+
+frame() {	# frame <cmd1> <cmd2>
+	sum=$(( (LENS_ADDR + $1 + $2) & 0xFF ))
+	printf "$(printf '\\377\\%03o\\%03o\\%03o\\000\\000\\%03o' "$LENS_ADDR" "$1" "$2" "$sum")" > "$LENS_PORT"
+}
+
+case "$1" in
+	zoom-in)    c1=0; c2=32 ;;	# 0x20 zoom tele
+	zoom-out)   c1=0; c2=64 ;;	# 0x40 zoom wide
+	focus-near) c1=1; c2=0 ;;	# cmd1 0x01
+	focus-far)  c1=0; c2=128 ;;	# 0x80
+	stop)       c1=0; c2=0 ;;
+	init)       c1=154; c2=0 ;;	# FF 01 9A 00 00 00 9B, then the version query
+	*) echo "usage: lens zoom-in|zoom-out|focus-near|focus-far [ms] | lens stop | lens init" >&2; exit 2 ;;
+esac
+
+[ -c "$LENS_PORT" ] || { echo "lens: no $LENS_PORT" >&2; exit 1; }
+stty -F "$LENS_PORT" "$LENS_BAUD" raw -echo 2>/dev/null
+
+frame "$c1" "$c2"
+if [ "$1" = init ]; then
+	usleep 300000
+	printf "EXVER\212" > "$LENS_PORT"
+	exit 0
+fi
+if [ "$1" != stop ] && [ -n "$2" ]; then
+	case "$2" in *[!0-9]*) echo "lens: time must be a number of milliseconds" >&2; exit 2 ;; esac
+	ms=$2
+	[ "$ms" -lt 10 ] && ms=10
+	[ "$ms" -gt 5000 ] && ms=5000
+	usleep $((ms * 1000))
+	frame 0 0
+fi

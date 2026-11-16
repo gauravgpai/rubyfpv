@@ -1,0 +1,13 @@
+#!/bin/sh
+#
+# The IMX335 2-lane RAW10 table (hisilicon-opensdk patch 0001) is timed for a
+# 24 MHz INCK, but sys_config clocks imx335 at 37.125 MHz (0x8010). Set the
+# sensor0 clock divider to 24 MHz before the streamer (S95) brings the sensor
+# up; the MIPI driver's ENABLE_SENSOR_CLOCK keeps the frequency field.
+
+case "$1" in
+	start)
+		[ "$(fw_printenv -n sensor 2>/dev/null)" = "imx335" ] || [ "$(ipcinfo -s 2>/dev/null)" = "imx335" ] || exit 0
+		devmem 0x11018440 32 0x4001
+		;;
+esac

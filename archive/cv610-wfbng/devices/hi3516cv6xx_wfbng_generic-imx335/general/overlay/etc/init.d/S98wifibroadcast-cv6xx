@@ -1,0 +1,33 @@
+#!/bin/sh
+#
+# wifibroadcast's video_settings (first boot, and `wifibroadcast reset`) is
+# written for SigmaStar: it points isp.sensorConfig at
+# /etc/sensors/<sensor>_<family>.bin, which only the Infinity6 sensor
+# packages ship, asks for 60 fps, and gives IMX335 1920x1440. None of that
+# exists on cv6xx, where majestic would then probe its way to the 5 MP
+# default profile. Sorted right after S98wifibroadcast, this puts the cv6xx
+# IMX335 mode back whenever the configured profile is a file that is not there.
+
+case "$1" in
+	start)
+		cfg=$(cli -g .isp.sensorConfig)
+		[ -n "$cfg" ] && [ ! -e "$cfg" ] || exit 0
+		if [ "$(ipcinfo -s)" != "imx335" ]; then
+			echo "isp.sensorConfig $cfg does not exist; no cv6xx profile for $(ipcinfo -s)" | logger -s -t wifibroadcast
+			exit 0
+		fi
+		echo "Replacing isp.sensorConfig $cfg with the cv6xx IMX335 flex mode" | logger -s -t wifibroadcast
+		cli -s .isp.sensorConfig /etc/sensors/modes/imx335_flex.ini
+		cli -s .video0.size 1920x1080
+		cli -s .video0.fps 30
+		killall -1 majestic
+		;;
+
+	stop)
+		;;
+
+	*)
+		echo "Usage: $0 {start|stop}"
+		exit 1
+		;;
+esac

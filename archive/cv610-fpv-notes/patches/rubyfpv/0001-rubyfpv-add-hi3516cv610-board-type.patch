@@ -1,0 +1,96 @@
+diff --git a/code/base/hardware.cpp b/code/base/hardware.cpp
+index 1306ef3..57151e3 100644
+--- a/code/base/hardware.cpp
++++ b/code/base/hardware.cpp
+@@ -575,6 +575,9 @@ void _hardware_detect_board_openipc(char* szBoardId)
+       s_uHardwareBoardType = BOARD_TYPE_OPENIPC_SIGMASTAR_338Q;
+    if ( NULL != strstr(szBoardId, "ssc33x") )
+       s_uHardwareBoardType = BOARD_TYPE_OPENIPC_SIGMASTAR_338Q;
++   // ipcinfo -c reports hi3516cv610 / hi3516cv608 on the OpenIPC hi3516cv6xx image
++   if ( NULL != strstr(szBoardId, "hi3516cv6") )
++      s_uHardwareBoardType = BOARD_TYPE_OPENIPC_HISILICON_CV610;
+    #endif
+ }
+ 
+@@ -865,6 +868,8 @@ int hardware_board_is_openipc(u32 uBoardType)
+       return 1;
+    if ( (uBoardType & BOARD_TYPE_MASK) == BOARD_TYPE_OPENIPC_SIGMASTAR_338Q )
+       return 1;
++   if ( (uBoardType & BOARD_TYPE_MASK) == BOARD_TYPE_OPENIPC_HISILICON_CV610 )
++      return 1;
+    return 0;
+ }
+ 
+@@ -884,6 +889,13 @@ int hardware_board_is_sigmastar(u32 uBoardType)
+    return 0;
+ }
+ 
++int hardware_board_is_hisilicon_cv6(u32 uBoardType)
++{
++   if ( (uBoardType & BOARD_TYPE_MASK) == BOARD_TYPE_OPENIPC_HISILICON_CV610 )
++      return 1;
++   return 0;
++}
++
+ bool _hardware_enum_joystick_query_device(const char* szDevicePath, int iDeviceIndex, hw_joystick_info_t* pJoystickInfo)
+ {
+    if ( (NULL == szDevicePath) || (0 == szDevicePath[0]) || (NULL == pJoystickInfo) )
+diff --git a/code/base/hardware.h b/code/base/hardware.h
+index 99751d3..f9d1a21 100644
+--- a/code/base/hardware.h
++++ b/code/base/hardware.h
+@@ -33,6 +33,8 @@
+ #define BOARD_TYPE_OPENIPC_GOKE300 32
+ 
+ #define BOARD_TYPE_OPENIPC_SIGMASTAR_338Q 40
++// HiSilicon V5 family (Hi3516CV610 / CV608). Dual Cortex-A7, majestic "lite" flavor.
++#define BOARD_TYPE_OPENIPC_HISILICON_CV610 50
+ 
+ #define BOARD_SUBTYPE_OPENIPC_UNKNOWN  0
+ #define BOARD_SUBTYPE_OPENIPC_GENERIC         ((u32)10)
+@@ -114,6 +116,7 @@ int hardware_board_is_radxa(u32 uBoardType);
+ int hardware_board_is_openipc(u32 uBoardType);
+ int hardware_board_is_goke(u32 uBoardType);
+ int hardware_board_is_sigmastar(u32 uBoardType);
++int hardware_board_is_hisilicon_cv6(u32 uBoardType);
+ 
+ void hardware_enum_joystick_interfaces();
+ int hardware_get_joystick_interfaces_count();
+diff --git a/code/common/string_utils.c b/code/common/string_utils.c
+index cb73a76..cc61047 100644
+--- a/code/common/string_utils.c
++++ b/code/common/string_utils.c
+@@ -790,6 +790,7 @@ const char* str_get_hardware_board_name(u32 board_type)
+    static const char* s_szBoardTypeOpenIPCGoke200 = "OpenIPC Goke200";
+    static const char* s_szBoardTypeOpenIPCGoke210 = "OpenIPC Goke210";
+    static const char* s_szBoardTypeOpenIPCGoke300 = "OpenIPC Goke300";
++   static const char* s_szBoardTypeOpenIPCHisiCV610 = "OpenIPC HI3516CV610 Generic";
+    static const char* s_szBoardTypeOpenIPCSigmasterGeneric = "OpenIPC SSC338Q Generic";
+    static const char* s_szBoardTypeOpenIPCSigmasterGeneric30KQ = "OpenIPC SSC30KQ Generic";
+    static const char* s_szBoardTypeOpenIPCSigmasterUltrasight = "Ultrasight AIO";
+@@ -835,6 +836,8 @@ const char* str_get_hardware_board_name(u32 board_type)
+       return s_szBoardTypeOpenIPCGoke210;
+    if ( (board_type & BOARD_TYPE_MASK) == BOARD_TYPE_OPENIPC_GOKE300 )
+       return s_szBoardTypeOpenIPCGoke300;
++   if ( (board_type & BOARD_TYPE_MASK) == BOARD_TYPE_OPENIPC_HISILICON_CV610 )
++      return s_szBoardTypeOpenIPCHisiCV610;
+    if ( (board_type & BOARD_TYPE_MASK) == BOARD_TYPE_OPENIPC_SIGMASTAR_338Q )
+    {
+       switch ( (board_type & BOARD_SUBTYPE_MASK) >> BOARD_SUBTYPE_SHIFT )
+@@ -876,6 +879,7 @@ const char* str_get_hardware_board_name_short(u32 board_type)
+    static const char* s_szBoardSTypeOpenIPCGoke200 = "Goke200";
+    static const char* s_szBoardSTypeOpenIPCGoke210 = "Goke210";
+    static const char* s_szBoardSTypeOpenIPCGoke300 = "Goke300";
++   static const char* s_szBoardSTypeOpenIPCHisiCV610 = "HI3516CV610";
+    static const char* s_szBoardSTypeOpenIPCSigmasterGeneric = "SSC338Q";
+    static const char* s_szBoardSTypeOpenIPCSigmasterGeneric30KQ = "SSC30KQ";
+    static const char* s_szBoardSTypeOpenIPCSigmasterUltrasight = "Ultrasight";
+@@ -919,6 +923,8 @@ const char* str_get_hardware_board_name_short(u32 board_type)
+       return s_szBoardSTypeOpenIPCGoke210;
+    if ( (board_type & BOARD_TYPE_MASK) == BOARD_TYPE_OPENIPC_GOKE300 )
+       return s_szBoardSTypeOpenIPCGoke300;
++   if ( (board_type & BOARD_TYPE_MASK) == BOARD_TYPE_OPENIPC_HISILICON_CV610 )
++      return s_szBoardSTypeOpenIPCHisiCV610;
+    if ( (board_type & BOARD_TYPE_MASK) == BOARD_TYPE_OPENIPC_SIGMASTAR_338Q )
+    {
+       switch ( (board_type & BOARD_SUBTYPE_MASK) >> BOARD_SUBTYPE_SHIFT)

@@ -1,0 +1,83 @@
+#!/bin/sh
+#
+# "lenscam" variant: second camera of a two-camera setup. No radio and no
+# Ruby here; the video goes over Ethernet to the server camera, which also
+# sends the zoom target and the encoder settings (camlink).
+#
+
+[ -f /etc/camlink.conf ] && . /etc/camlink.conf
+OWN_IP=${OWN_IP:-192.168.1.11}
+SERVER_IP=${SERVER_IP:-192.168.1.10}
+
+want() {	# want <key> <value>: write a majestic setting only if it differs
+	[ "$(cli -g "$1" 2>/dev/null)" = "$2" ] || cli -s "$1" "$2"
+}
+
+# majestic keeps a list of output addresses (outgoing.servers) and adds every
+# new outgoing.server to it instead of replacing. Drop the list at boot so
+# only the address set afterwards is used.
+clear_outputs() {
+	y=/etc/majestic.yaml
+	[ -f "$y" ] || return 0
+	awk '/^  servers:[ \t]*$/ { skip = 1; next }
+	     skip && (/^  - / || /^    /) { next }
+	     { skip = 0; print }' "$y" > /tmp/majestic.yaml.new || return 0
+	if ! cmp -s "$y" /tmp/majestic.yaml.new; then
+		cat /tmp/majestic.yaml.new > "$y"
+		logger -t camvideo "cleared majestic's list of output addresses"
+	fi
+	rm -f /tmp/majestic.yaml.new
+}
+
+case "$1" in
+	start)
+		# Fixed address. The DHCP client stays: with no server on this link it
+		# falls back to the U-Boot variable ipaddr every few seconds, so that
+		# variable is set to the address too. (Stopping the client instead
+		# left the camera without any address.)
+		[ "$(fw_printenv -n ipaddr 2>/dev/null)" = "$OWN_IP" ] || fw_setenv ipaddr "$OWN_IP"
+		ifconfig eth0 "$OWN_IP" netmask 255.255.255.0 up
+
+		clear_outputs
+		want .outgoing.enabled true
+		want .outgoing.server "udp://$SERVER_IP:5604"
+		want .video0.enabled true
+		want .video0.codec h265
+		want .video0.rcMode cbr
+		want .video1.enabled false
+		want .isp.slowShutter disabled
+		want .rtsp.enabled false
+		want .hls.enabled false
+		want .netip.enabled false
+		want .jpeg.enabled false
+		want .watchdog.enabled false
+
+		# Own video mode (see /etc/camlink.conf); otherwise camlink takes
+		# resolution, frame rate and sensor profile from the server.
+		if [ "${OWN_MODE:-0}" = 1 ]; then
+			case "${MODE:-1080p60}" in
+				1080p60) m="imx335_2l_1080p60 1920x1080 60" ;;
+				1080p90) m="imx335_2l_1080p90 1920x1080 90" ;;
+				864p120) m="imx335_2l_864p120 1536x864 120" ;;
+				720p120) m="imx335_2l_720p120 1280x720 120" ;;
+				972p60)  m="imx335_2l_bin972p60 1296x972 60" ;;
+				*) m="" ; logger -t camlink "unknown MODE $MODE, video mode left as it is" ;;
+			esac
+			if [ -n "$m" ]; then
+				set -- $m
+				want .isp.sensorConfig "/etc/sensors/$1.ini"
+				want .video0.size "$2"
+				want .video0.fps "$3"
+			fi
+		fi
+
+		start-stop-daemon -S -b -q -x /usr/sbin/camlink
+		;;
+	stop)
+		start-stop-daemon -K -q -x /usr/sbin/camlink
+		;;
+	*)
+		echo "Usage: $0 {start|stop}"
+		exit 1
+		;;
+esac

@@ -1,0 +1,30 @@
+From: cv610-fpv
+Subject: [PATCH] OpenIPC: do not chmod the binaries
+
+ruby_start runs chmod 777 /usr/sbin/ruby* on every start. On the camera
+those files are in the squashfs under an overlay, so the chmod copies each
+binary up into the settings partition, and the copies then hide the
+binaries of any firmware flashed later with settings kept. They are
+already executable; skip the chmod on OpenIPC.
+---
+diff --git a/code/r_start/ruby_start.cpp b/code/r_start/ruby_start.cpp
+index 71d7b2a..7b52e4f 100644
+--- a/code/r_start/ruby_start.cpp
++++ b/code/r_start/ruby_start.cpp
+@@ -853,10 +853,16 @@ int _step_find_console()
+ 
+    sprintf(szComm, "mkdir -p %s", FOLDER_CONFIG);
+    hw_execute_bash_command(szComm, NULL);
++   // On the OpenIPC camera the binaries are in the read-only squashfs, already
++   // executable. A chmod there makes overlayfs copy each one up into the
++   // settings partition, where it then hides the binaries of every later
++   // firmware flashed with settings kept.
++   #if !defined(HW_PLATFORM_OPENIPC_CAMERA)
+    sprintf(szComm, "chmod 777 %sruby* 2>/dev/null", FOLDER_BINARIES);
+    hw_execute_bash_command(szComm, NULL);
+    sprintf(szComm, "chmod 777 %sonyx* 2>/dev/null", FOLDER_BINARIES);
+    hw_execute_bash_command(szComm, NULL);
++   #endif
+ 
+    #if defined (HW_PLATFORM_RASPBERRY) || defined (HW_PLATFORM_RADXA)
+    hw_execute_bash_command("chown -hR root *", NULL);

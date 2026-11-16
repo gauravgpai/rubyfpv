@@ -1,0 +1,37 @@
+From: cv610-fpv
+Subject: [PATCH] CV610: skip sub-millisecond video packet pacing sleeps
+
+Before each video packet Ruby sleeps 3/4 of the previous packet's airtime
+(a few hundred microseconds at MCS-2). With high-resolution timers each
+sleep is two context switches and a timer interrupt, ~1600 of them a second
+at 10 Mbit/s, on a two-core A7 that is already busy encoding. On the CV610
+sleeps under 1 ms are skipped and the driver's TX queue absorbs the
+packet; longer ones (slow data rates) still happen. Other boards unchanged.
+---
+--- a/code/r_vehicle/video_tx_buffers.cpp
++++ b/code/r_vehicle/video_tx_buffers.cpp
+@@ -38,6 +38,7 @@
+ #include "packets_utils.h"
+ #include "../common/string_utils.h"
+ #include "../base/hardware_cam_maj.h"
++#include "../base/hardware.h"
+ #include "../radio/fec.h"
+ #include "adaptive_video.h"
+ #include "processor_tx_video.h"
+@@ -866,7 +867,15 @@
+    {
+       // Don't spam the driver with packets while it's sending a packet;
+       // Better yield that time to other processes.
+-      hardware_sleep_micros(((m_uLastSentVideoPacketDurationMicros - (uTimeMicros - m_uLastTimeSentVideoPacketMicros))*3)/4 );
++      u32 uSleepMicros = ((m_uLastSentVideoPacketDurationMicros - (uTimeMicros - m_uLastTimeSentVideoPacketMicros))*3)/4;
++      // CV610: a sleep this short costs more than it yields (two context
++      // switches and a timer interrupt per video packet, ~1600 a second at
++      // 10 Mbit/s); the driver's TX queue absorbs the packet instead.
++      static int s_iSkipShortPacingSleeps = -1;
++      if ( -1 == s_iSkipShortPacingSleeps )
++         s_iSkipShortPacingSleeps = hardware_board_is_hisi_cv610(hardware_getBoardType()) ? 1 : 0;
++      if ( (0 == s_iSkipShortPacingSleeps) || (uSleepMicros >= 1000) )
++         hardware_sleep_micros(uSleepMicros);
+    }
+    m_uLastTimeSentVideoPacketMicros = uTimeMicros;
+ 

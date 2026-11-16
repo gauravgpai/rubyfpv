@@ -1,0 +1,27 @@
+From: cv610-fpv
+Subject: [PATCH] OpenIPC resolutions: add 1536x864 (864p)
+
+The IMX335 2-lane 120 fps mode on the Hi3516CV610 is a 1536x864 crop.
+The OpenIPC resolution list had nothing between 1456x816 and 1080p, so
+the camera scaled the crop down. The list is shared: the controller
+needs the same entry to show and select it.
+---
+--- a/code/base/video_capture_res.cpp
++++ b/code/base/video_capture_res.cpp
+@@ -47,6 +47,7 @@
+    {960, 720, 120, "720p 4:3"},
+    {1280,720, 120, "720p"},
+    {1456,816, 120, "820p"},
++   {1536,864, 120, "864p"},
+    {1440, 1080, 90, "1080p 4:3"},
+    {1920,1080, 90, "1080p"},
+    {1920, 1440, 90, "1.4k 4:3"},
+@@ -54,7 +55,7 @@
+    {3200,1800, 30, "3K"},
+    {3840,2160, 20, "4k"}
+ };
+-int g_iListCaptureResolutionsOpenIPCCount = 11;
++int g_iListCaptureResolutionsOpenIPCCount = 12;
+ 
+ 
+ type_video_capture_resolution_info* getOptionsVideoResolutions(int iCameraType)

@@ -1,0 +1,37 @@
+From: cv610-fpv
+Subject: [PATCH] CV610: wait 1 ms, not 100 us, for video from majestic
+
+The vehicle main loop reads majestic's UDP video with select() and a
+100 us timeout. Under the stock 100 Hz kernel that wait lasted 10 ms; with
+high-resolution timers it is 100 us, and ruby_rt_vehicle woke ~5800 times
+a second polling an empty socket between video bursts, most of the timer
+interrupts and context switches on the camera. select() returns as soon as
+data arrives, so 1 ms adds no video latency and keeps the loop at 1 kHz
+when idle. Other boards unchanged.
+---
+--- a/code/r_vehicle/video_source_majestic.cpp
++++ b/code/r_vehicle/video_source_majestic.cpp
+@@ -35,6 +35,7 @@
+ #include "../base/shared_mem.h"
+ #include "../base/hardware_camera.h"
+ #include "../base/hardware_cam_maj.h"
++#include "../base/hardware.h"
+ #include "../base/hardware_procs.h"
+ #include "../base/ruby_ipc.h"
+ #include "../base/parser_h264.h"
+@@ -453,6 +454,15 @@
+       struct timeval timeWait;
+       timeWait.tv_sec = 0;
+       timeWait.tv_usec = 100;
++      // CV610: with high-resolution timers a 100 us wait really is 100 us,
++      // and the main loop polls the empty socket ~6000 times a second
++      // between video bursts. select() returns as soon as data arrives, so
++      // 1 ms costs no video latency and still runs the loop at 1 kHz idle.
++      static int s_iLongerUDPWait = -1;
++      if ( -1 == s_iLongerUDPWait )
++         s_iLongerUDPWait = hardware_board_is_hisi_cv610(hardware_getBoardType()) ? 1 : 0;
++      if ( s_iLongerUDPWait )
++         timeWait.tv_usec = 1000;
+       int res = select(s_fInputVideoStreamUDPSocket+1, &fdSet, NULL, NULL, &timeWait);
+       if ( res < 0 )
+       {

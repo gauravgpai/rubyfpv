@@ -1,0 +1,26 @@
+From: cv610-fpv
+Subject: [PATCH] CV610: write isp.exposure in milliseconds
+
+Ruby writes the camera shutter speed to majestic.yaml in seconds
+(iShutterSpeed/1000, so 10 ms becomes 0.01) except on SigmaStar. The
+majestic on the Hi3516CV610 takes milliseconds, as SigmaStar does, so
+auto-exposure was capped at 0.01 ms: ~800x sensor gain, a noisy grey
+picture, the encoder at max QP 42 and still at twice its bitrate, and
+video dropped on the radio. The live API path already sends ms.
+---
+--- a/code/base/hardware_cam_maj.cpp
++++ b/code/base/hardware_cam_maj.cpp
+@@ -652,8 +652,11 @@
+       else
+          sprintf(szComm, "cli -s .isp.exposure %.2f", -(float)iShutterSpeed/1000.0);
+ 
+-      // exposure is in milisec for ssc338q
+-      if ( hardware_board_is_sigmastar(hardware_getBoardType()) )
++      // exposure is in milisec for ssc338q, and for the majestic on the
++      // Hi3516CV610 too: 0.01 there caps auto-exposure at 0.01 ms, and the
++      // sensor makes up the light with ~800x gain (a noisy picture the
++      // encoder cannot fit in its bitrate even at max QP).
++      if ( hardware_board_is_sigmastar(hardware_getBoardType()) || hardware_board_is_hisi_cv610(hardware_getBoardType()) )
+       {
+          if ( iShutterSpeed > 0 )
+             sprintf(szComm, "cli -s .isp.exposure %d", iShutterSpeed);

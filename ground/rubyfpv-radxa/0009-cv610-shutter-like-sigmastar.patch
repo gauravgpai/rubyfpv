@@ -1,0 +1,83 @@
+From: cv610-fpv
+Subject: [PATCH] CV610: shutter handled as on SigmaStar
+
+The majestic on the Hi3516CV610 takes exposure and QP delta changes
+live, as on SigmaStar, but Ruby only knew that for SigmaStar:
+- the exposure limit was not clamped to the frame time (14 ms kept at
+  120 fps, where a frame is 8.3 ms);
+- a shutter change restarted the whole video pipeline;
+- a QP delta change was not passed on;
+- the controller showed no shutter mode/value for this camera.
+Shared code: vehicle and controller both need it (the menu, and the
+same clamp on both copies of the model).
+---
+--- a/code/base/models.cpp
++++ b/code/base/models.cpp
+@@ -3859,7 +3859,7 @@
+    int iNewValue = iValue;
+ 
+    if ( isRunningOnOpenIPCHardware() )
+-   if ( hardware_board_is_sigmastar(hwCapabilities.uBoardType) )
++   if ( hardware_board_is_sigmastar(hwCapabilities.uBoardType) || hardware_board_is_hisi_cv610(hwCapabilities.uBoardType) )
+    {
+       if ( video_params.iVideoFPS > 0 )
+       if ( iNewValue > 1000/video_params.iVideoFPS - 2 )
+--- a/code/r_vehicle/video_sources.cpp
++++ b/code/r_vehicle/video_sources.cpp
+@@ -584,7 +584,7 @@
+ 
+    if ( pCurrentCameraProfileParams->iShutterSpeed != pOldCameraProfileParams->iShutterSpeed )
+    {
+-      if ( hardware_board_is_sigmastar(g_pCurrentModel->hwCapabilities.uBoardType) )
++      if ( hardware_board_is_sigmastar(g_pCurrentModel->hwCapabilities.uBoardType) || hardware_board_is_hisi_cv610(g_pCurrentModel->hwCapabilities.uBoardType) )
+       {
+          hardware_camera_maj_set_exposure(pCurrentCameraProfileParams->iShutterSpeed);
+          iCountChanges++;
+@@ -608,7 +608,7 @@
+    if ( hardware_is_running_on_openipc() )
+    {
+       if ( pCurrentCameraProfileParams->iShutterSpeed != pOldCameraProfileParams->iShutterSpeed )
+-      if ( ! hardware_board_is_sigmastar(g_pCurrentModel->hwCapabilities.uBoardType) )
++      if ( ! (hardware_board_is_sigmastar(g_pCurrentModel->hwCapabilities.uBoardType) || hardware_board_is_hisi_cv610(g_pCurrentModel->hwCapabilities.uBoardType)) )
+          bDoFullRestart = true;
+       if ( pOldVideoProfile->video_data_length != pNewVideoProfile->video_data_length )
+          bDoFullRestart = true;
+@@ -773,7 +773,7 @@
+    {
+       log_line("[VideoSources] OnChangedVideoParams: Handle video quantization change...");
+       iCountChanges++;
+-      if ( g_pCurrentModel->isActiveCameraOpenIPC() && hardware_board_is_sigmastar(g_pCurrentModel->hwCapabilities.uBoardType) )
++      if ( g_pCurrentModel->isActiveCameraOpenIPC() && (hardware_board_is_sigmastar(g_pCurrentModel->hwCapabilities.uBoardType) || hardware_board_is_hisi_cv610(g_pCurrentModel->hwCapabilities.uBoardType)) )
+       {
+          hardware_camera_maj_set_qpdelta(pNewVideoProfile->iIPQuantizationDelta);
+          s_iLastSetIPQDelta = pNewVideoProfile->iIPQuantizationDelta;
+--- a/code/r_central/menu/menu_vehicle_camera.cpp
++++ b/code/r_central/menu/menu_vehicle_camera.cpp
+@@ -374,14 +374,17 @@
+          m_pItemsSlider[6]->setMargin(fMargin);
+          m_IndexShutterValue = addMenuItem(m_pItemsSlider[6]);
+       }
+-      else if ( hardware_board_is_sigmastar(g_pCurrentModel->hwCapabilities.uBoardType) )
++      else if ( hardware_board_is_sigmastar(g_pCurrentModel->hwCapabilities.uBoardType) || hardware_board_is_hisi_cv610(g_pCurrentModel->hwCapabilities.uBoardType) )
+       {
++         if ( hardware_board_is_sigmastar(g_pCurrentModel->hwCapabilities.uBoardType) )
++         {
+          m_pItemsSelect[22] = new MenuItemSelect("3D Noise Algo", "Sets NR3D algorithms used by the camera ISP processor to reduce noise in the image.");
+          m_pItemsSelect[22]->addSelection(L("FPV (Default)"));
+          m_pItemsSelect[22]->addSelection("Sigmastar");
+          m_pItemsSelect[22]->setIsEditable();
+          m_pItemsSelect[22]->setMargin(fMargin);
+          m_IndexOpenIPC3A = addMenuItem(m_pItemsSelect[22]);
++         }
+ 
+          m_pItemsSelect[7] = new MenuItemSelect(L("Shutter Speed Mode"), L("Sets the shutter speed to be auto controllerd by camera or manual set by user."));  
+          m_pItemsSelect[7]->addSelection(L("Auto"));
+@@ -665,7 +668,7 @@
+ 
+    if ( g_pCurrentModel->isActiveCameraOpenIPC() )
+    {
+-      if ( hardware_board_is_sigmastar(g_pCurrentModel->hwCapabilities.uBoardType) )
++      if ( hardware_board_is_sigmastar(g_pCurrentModel->hwCapabilities.uBoardType) || hardware_board_is_hisi_cv610(g_pCurrentModel->hwCapabilities.uBoardType) )
+       if ( -1 != m_IndexShutterMode )
+       {
+          if ( g_pCurrentModel->camera_params[g_pCurrentModel->iCurrentCamera].profiles[iCameraProfileIndex].iShutterSpeed <= 0 )

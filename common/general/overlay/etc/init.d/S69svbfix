@@ -1,0 +1,16 @@
+#!/bin/sh
+#
+# The vendor power-management module (open_pm, loaded by S70vendor through
+# load_hisilicon) compares the SVB PWM setting the boot ROM left in the CRG
+# (0x11014580) with the copy U-Boot is expected to store in sysctrl
+# (0x1102034C). The OpenIPC U-Boot never writes that copy, so the compare
+# fails and open_pm powers the PLL down: a hard hang right after the media
+# modules load. Store the copy here, before S70vendor. Writing the value the
+# CRG already holds is a no-op when U-Boot did its job.
+
+case "$1" in
+	start)
+		pwm=$(devmem 0x11014580 32)
+		[ "$(devmem 0x1102034C 32)" = "$pwm" ] || devmem 0x1102034C 32 "$pwm"
+		;;
+esac

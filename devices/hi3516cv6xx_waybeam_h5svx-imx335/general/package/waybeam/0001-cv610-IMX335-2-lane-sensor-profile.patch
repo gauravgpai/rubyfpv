@@ -1,0 +1,362 @@
+From: cv610-fpv
+Subject: [PATCH] cv610: IMX335 2-lane sensor profile, 1080p60/90, 864p120, 720p120 crop, wide and binned 60
+
+The CV610 backend hardcoded the IMX662: plugin path, object symbol, ISP
+bind id, lanes 0..3 and its mode table. Move those into a per-sensor
+descriptor (src/cv610_modes.c), picked at runtime by CV610_SENSOR, and add
+IMX335 wired to MIPI PHY lanes 0 and 2 (Hi3516CV610-20S modules), 24 MHz
+INCK: 5MP30; through the plugin flex crop mode (new per-mode sns_mode,
+passed as pub.sns_mode) 1080p60/90, 1536x864@120 and a wide 2304x1296@60 and a native 1296x720@120 crop;
+and its 2x2 binning (sns_mode 1), 1296x972@60. IMX662 stays the default.
+video0.size auto rounds the capture size down to the 8-pixel encoder grid.
+
+S95waybeam gains CV610_MODULES=firmware, which uses the MPP set the OpenIPC
+firmware loaded at boot (load_hisilicon with the vendor open_pm) instead of
+load-cv610-online, which refuses vendor open_pm.
+
+diff --git a/include/cv610_modes.h b/include/cv610_modes.h
+index e05f6ff..3ba2b80 100644
+--- a/include/cv610_modes.h
++++ b/include/cv610_modes.h
+@@ -22,8 +22,33 @@ typedef struct {
+ 	uint32_t raw_bit;          /* MIPI RAW bit depth carried by this mode */
+ 	uint32_t sensor_clock_hz;  /* MCLK the mode's line timing assumes */
+ 	const char *desc;          /* /api/v1/modes label */
++	uint32_t sns_mode;         /* ot_isp_pub_attr.sns_mode hint for the plugin */
+ } Cv610SensorMode;
+ 
++/* One sensor the CV610 graph can drive.  Everything sensor-specific that the
++ * MPP API will not report lives here: which plugin to dlopen, the ISP bind
++ * id, the board's MIPI lane wiring, and the plugin's mode table.
++ *
++ * Selected once per process from the CV610_SENSOR environment variable
++ * (S95waybeam exports it from /etc/waybeam-cv610.conf); unset or unknown
++ * means imx662, the reference board. */
++typedef struct {
++	const char *name;          /* CV610_SENSOR value */
++	const char *lib_path;      /* sensor plugin */
++	const char *obj_symbol;    /* ot_isp_sns_obj exported by the plugin */
++	int sns_id;                /* ot_isp_bind_attr.sns_id, the plugin's *_ID */
++	short lane_id[4];          /* combo_dev_attr lane_id, -1 = unused */
++	int bayer;                 /* ot_isp_bayer_format */
++	const Cv610SensorMode *modes;
++	size_t mode_count;
++} Cv610Sensor;
++
++/* The active sensor.  Never NULL. */
++const Cv610Sensor *cv610_sensor(void);
++
++/* Number of MIPI data lanes the sensor is wired with. */
++int cv610_sensor_lane_count(const Cv610Sensor *sensor);
++
+ /* The mode table, in advertised (index) order.  Never NULL. */
+ const Cv610SensorMode *cv610_mode_table(size_t *count);
+ 
+diff --git a/include/cv610_pipeline.h b/include/cv610_pipeline.h
+index fd094b0..e79bc33 100644
+--- a/include/cv610_pipeline.h
++++ b/include/cv610_pipeline.h
+@@ -20,6 +20,8 @@ typedef struct {
+ 	int data_rate_x2;
+ 	int bayer;
+ 	int raw_bit;
++	/* Plugin image-mode hint (pub.sns_mode): 0 = pick by size and rate. */
++	uint32_t sns_mode;
+ 	/* image.mirror / image.flip.  Applied at the SENSOR (the plugin's
+ 	 * pfn_mirror_flip), matching what both SigmaStar backends do, so
+ 	 * `image.*` means the same thing on every board and the encoder is not
+diff --git a/init.d/S95waybeam.cv610 b/init.d/S95waybeam.cv610
+index 079cc1a..691f7ae 100755
+--- a/init.d/S95waybeam.cv610
++++ b/init.d/S95waybeam.cv610
+@@ -20,6 +20,12 @@ WAYBEAM_ENABLED=1
+ # 30/60/90).  It names a clock profile, not the sensor -- that is an IMX662.
+ CV610_SENSOR_PROFILE=sc4336p
+ CV610_AUDIO=0
++# Sensor the daemon drives (imx662 or imx335); see src/cv610_modes.c.
++CV610_SENSOR=imx662
++# "loader" brings the MPP modules up with load-cv610-online.  "firmware"
++# trusts the set the OpenIPC firmware already loaded at boot (load_hisilicon,
++# vendor open_pm) and skips the loader, which refuses vendor open_pm.
++CV610_MODULES=loader
+ # The platform override is target-local by design.
+ # shellcheck disable=SC1090
+ [ -r "$PLATFORM_CONFIG" ] && . "$PLATFORM_CONFIG"
+@@ -45,8 +51,17 @@ start()
+ 	if [ -r "$PIDFILE" ]; then
+ 		rm -f "$PIDFILE"
+ 	fi
+-	CV610_SENSOR_PROFILE="$CV610_SENSOR_PROFILE" \
+-		CV610_AUDIO="$CV610_AUDIO" "$LOADER" start || return 1
++	if [ "$CV610_MODULES" = "firmware" ]; then
++		grep -q "^open_vi " /proc/modules &&
++			grep -q "^open_venc " /proc/modules || {
++			echo "CV610_MODULES=firmware but the MPP modules are not loaded" >&2
++			return 1
++		}
++	else
++		CV610_SENSOR_PROFILE="$CV610_SENSOR_PROFILE" \
++			CV610_AUDIO="$CV610_AUDIO" "$LOADER" start || return 1
++	fi
++	export CV610_SENSOR
+ 	: >"$LOGFILE"
+ 	start-stop-daemon -S -m -q -p "$PIDFILE" -x "$DAEMON" -- \
+ 		>>"$LOGFILE" 2>&1 &
+@@ -65,7 +80,7 @@ start()
+ 		# nothing; the next start re-inits against them.
+ 		return 1
+ 	fi
+-	echo "Started $NAME (sensor profile $CV610_SENSOR_PROFILE, audio $CV610_AUDIO)"
++	echo "Started $NAME (sensor $CV610_SENSOR, modules $CV610_MODULES, sensor profile $CV610_SENSOR_PROFILE, audio $CV610_AUDIO)"
+ }
+ 
+ stop()
+diff --git a/src/cv610_modes.c b/src/cv610_modes.c
+index 358a14b..7676cd1 100644
+--- a/src/cv610_modes.c
++++ b/src/cv610_modes.c
+@@ -1,6 +1,9 @@
+ #include "cv610_modes.h"
+ 
+-/* All four entries are hardware-verified on the IMX662 bring-up board.
++#include <stdlib.h>
++#include <string.h>
++
++/* IMX662: all four entries are hardware-verified on the bring-up board.
+  *
+  * The clock column is the one that bites.  The sensor keeps whatever line
+  * timing it was programmed with regardless of the MCLK it is actually fed,
+@@ -9,15 +12,96 @@
+  * Measured 43.6 fps for the 60 fps mode when it ran on the 100 fps mode's
+  * 27 MHz clock.  Only 100 fps takes the sensor's 24 MHz INCK profile
+  * overclocked to 27 MHz (INCK_SEL 0x04); the rest run 37.125 MHz. */
+-static const Cv610SensorMode g_cv610_modes[] = {
+-	{ 1920, 1080,  30, 12, 37125000u, "1080p30 RAW12" },
+-	{ 1920, 1080,  60, 12, 37125000u, "1080p60 RAW12" },
+-	{ 1920, 1080,  90, 10, 37125000u, "1080p90 RAW10" },
+-	{ 1920, 1080, 100, 10, 27000000u, "1080p100 RAW10" },
++static const Cv610SensorMode g_imx662_modes[] = {
++	{ 1920, 1080,  30, 12, 37125000u, "1080p30 RAW12", 0 },
++	{ 1920, 1080,  60, 12, 37125000u, "1080p60 RAW12", 0 },
++	{ 1920, 1080,  90, 10, 37125000u, "1080p90 RAW10", 0 },
++	{ 1920, 1080, 100, 10, 27000000u, "1080p100 RAW10", 0 },
++};
++
++/* IMX335 on a board that wires only two MIPI data lanes, to PHY lanes 0
++ * and 2 (Hi3516CV610-20S + IMX335, e.g. the H5SVX module), at 1188 Mbit/s
++ * per lane on a 24 MHz INCK. The plugin needs the cv610-fpv 2-lane tables:
++ * mode 0 is the stock-firmware 2592x1944 RAW10 init, sns_mode 5 its window
++ * crop (flex) mode, which sets the crop and carries the rate in HMAX.
++ *
++ * Two lanes cap the line rate: a 1944-pixel RAW10 row needs HMAX >= ~319,
++ * so 1080p tops out at ~101 fps (1080p105 truncates frames on the bench;
++ * 1080p90 is the table's top 1080p mode),
++ * and the sensor itself needs HMAX >= 275 (shorter lines come out
++ * streaked). The 120 fps tier is therefore a 1536x864 crop at its own,
++ * shorter frame length. The plugin refuses anything faster.
++ *
++ * Two more 60 fps modes, picked by sensor.mode (video0.fps 60 alone selects
++ * 1080p60, the first entry at that rate): a 2304x1296 crop (89% of the
++ * sensor width, VPSS scales it to video0.size) and the sensor's 2x2 binning
++ * (plugin mode 1), the full field of view at 1296x972. Binning reads 4H per
++ * output row and cannot go below the 275 line minimum either, so it tops out
++ * at ~66 fps; 90 is not reachable.
++ *
++ * Last, a native 720p crop at 120 fps (sensor.mode only). The plugin's flex
++ * window must be a multiple of 24 wide, so it captures 1296x720 (50% of the
++ * sensor width, against 59% for 864p120 scaled to 720p); set video0.size
++ * 1280x720 for a standard 720p stream. It runs at HMAX ~393, well above the
++ * 275 line minimum. All entries
++ * hardware-verified on the bring-up board: no MIPI CRC/ECC errors, clean
++ * image, VPSS and the RTP output at the listed rate. */
++static const Cv610SensorMode g_imx335_2lane_modes[] = {
++	{ 2592, 1944,  30, 10, 24000000u, "5MP30 RAW10 2-lane", 0 },
++	{ 1920, 1080,  60, 10, 24000000u, "1080p60 RAW10 2-lane", 5 },
++	{ 1920, 1080,  90, 10, 24000000u, "1080p90 RAW10 2-lane", 5 },
++	{ 1536,  864, 120, 10, 24000000u, "864p120 RAW10 2-lane", 5 },
++	{ 2304, 1296,  60, 10, 24000000u, "1296p60 wide RAW10 2-lane", 5 },
++	{ 1296,  972,  60, 10, 24000000u, "binned 972p60 full-FOV RAW10 2-lane", 1 },
++	{ 1296,  720, 120, 10, 24000000u, "720p120 native crop RAW10 2-lane", 5 },
+ };
+ 
+-#define CV610_MODE_COUNT \
+-	(sizeof(g_cv610_modes) / sizeof(g_cv610_modes[0]))
++static const Cv610Sensor g_cv610_sensors[] = {
++	{ "imx662", "/usr/lib/sensors/libsns_imx662.so", "g_sns_imx662_obj",
++	  662, { 0, 1, 2, 3 }, 0, g_imx662_modes,
++	  sizeof(g_imx662_modes) / sizeof(g_imx662_modes[0]) },
++	{ "imx335", "/usr/lib/sensors/libsns_imx335.so", "g_sns_imx335_obj",
++	  335, { 0, 2, -1, -1 }, 0, g_imx335_2lane_modes,
++	  sizeof(g_imx335_2lane_modes) / sizeof(g_imx335_2lane_modes[0]) },
++};
++
++#define CV610_SENSOR_COUNT \
++	(sizeof(g_cv610_sensors) / sizeof(g_cv610_sensors[0]))
++
++const Cv610Sensor *cv610_sensor(void)
++{
++	static const Cv610Sensor *active;
++	const char *want;
++	size_t i;
++
++	if (active != NULL)
++		return active;
++	active = &g_cv610_sensors[0];
++	want = getenv("CV610_SENSOR");
++	if (want == NULL || *want == '\0')
++		return active;
++	for (i = 0; i < CV610_SENSOR_COUNT; ++i) {
++		if (strcmp(g_cv610_sensors[i].name, want) == 0) {
++			active = &g_cv610_sensors[i];
++			break;
++		}
++	}
++	return active;
++}
++
++int cv610_sensor_lane_count(const Cv610Sensor *sensor)
++{
++	int i, n = 0;
++
++	for (i = 0; i < 4; ++i) {
++		if (sensor->lane_id[i] >= 0)
++			++n;
++	}
++	return n;
++}
++
++#define g_cv610_modes    (cv610_sensor()->modes)
++#define CV610_MODE_COUNT (cv610_sensor()->mode_count)
+ 
+ const Cv610SensorMode *cv610_mode_table(size_t *count)
+ {
+@@ -131,8 +215,10 @@ void cv610_mode_resolve_output(const Cv610SensorMode *mode,
+ 	if (mode != NULL) {
+ 		int given = (req_width != 0 && req_height != 0);
+ 
+-		w = given ? req_width : mode->width;
+-		h = given ? req_height : mode->height;
++		/* "auto" is the capture size rounded down to the encoder's
++		 * 8-pixel grid (the binned 1296x972 becomes 1296x968). */
++		w = given ? req_width : mode->width & ~7u;
++		h = given ? req_height : mode->height & ~7u;
+ 	}
+ 	if (out_width)
+ 		*out_width = w;
+diff --git a/src/cv610_pipeline.c b/src/cv610_pipeline.c
+index 73c0620..45e7033 100644
+--- a/src/cv610_pipeline.c
++++ b/src/cv610_pipeline.c
+@@ -42,11 +42,11 @@
+ #include "ss_mpi_ae.h"
+ #include "ss_mpi_awb.h"
+ 
++#include "cv610_modes.h"
++
+ #define MIPI_DEV_NODE       "/dev/ot_mipi_rx"
+-#define SNS_LIB_PATH        "/usr/lib/sensors/libsns_imx662.so"
+-#define SNS_OBJ_SYMBOL      "g_sns_imx662_obj"
+-/* Must match IMX662_ID in the sensor driver (imx662_cmos_param.h). */
+-#define IMX662_SNS_ID       662
++/* Plugin path, object symbol, ISP bind id and lane wiring come from the
++ * active sensor: cv610_sensor() in src/cv610_modes.c. */
+ 
+ #define VI_DEV              0
+ #define VI_PIPE             0
+@@ -88,6 +88,7 @@ typedef struct {
+ 	int          data_rate_x2; /* MIPI_DATA_RATE_X1 or X2 */
+ 	int          bayer;        /* ot_isp_bayer_format 0..3 */
+ 	int          raw_bit;      /* 10 or 12 */
++	uint32_t     sns_mode;     /* pub.sns_mode hint for the plugin */
+ 	uint32_t     sensor_clock_hz; /* MCLK this mode's line timing assumes */
+ 	unsigned int out_width;    /* VPSS output = encoded size */
+ 	unsigned int out_height;
+@@ -188,7 +189,8 @@ static int mipi_setup(const Cv610PipelineRuntimeConfig *c)
+ 		(c->raw_bit == 10) ? DATA_TYPE_RAW_10BIT : DATA_TYPE_RAW_12BIT;
+ 	attr.mipi_attr.wdr_mode = OT_MIPI_WDR_MODE_NONE;
+ 	for (i = 0; i < MIPI_LANE_NUM; i++) {
+-		attr.mipi_attr.lane_id[i] = (i < c->lanes) ? (short)i : (short)-1;
++		attr.mipi_attr.lane_id[i] =
++			(i < 4) ? cv610_sensor()->lane_id[i] : (short)-1;
+ 	}
+ 
+ 	fd = open(MIPI_DEV_NODE, O_RDWR);
+@@ -460,18 +462,20 @@ static ot_isp_3a_alg_lib g_awb_lib = { .id = VI_PIPE, .lib_name = "ot_awb_lib" }
+ static int sensor_setup(int i2c_bus)
+ {
+ 	ot_isp_sns_commbus bus;
++	const Cv610Sensor *sns = cv610_sensor();
+ 
+-	g_sns_handle = dlopen(SNS_LIB_PATH, RTLD_NOW | RTLD_GLOBAL);
++	g_sns_handle = dlopen(sns->lib_path, RTLD_NOW | RTLD_GLOBAL);
+ 	if (g_sns_handle == NULL) {
+-		fprintf(stderr, "dlopen %s: %s\n", SNS_LIB_PATH, dlerror());
++		fprintf(stderr, "dlopen %s: %s\n", sns->lib_path, dlerror());
+ 		return -1;
+ 	}
+-	g_sns_obj = (ot_isp_sns_obj *)dlsym(g_sns_handle, SNS_OBJ_SYMBOL);
++	g_sns_obj = (ot_isp_sns_obj *)dlsym(g_sns_handle, sns->obj_symbol);
+ 	if (g_sns_obj == NULL) {
+-		fprintf(stderr, "dlsym %s: %s\n", SNS_OBJ_SYMBOL, dlerror());
++		fprintf(stderr, "dlsym %s: %s\n", sns->obj_symbol, dlerror());
+ 		return -1;
+ 	}
+-	printf("  ok  dlopen %s -> %s @ %p\n", SNS_LIB_PATH, SNS_OBJ_SYMBOL, (void *)g_sns_obj);
++	printf("  ok  dlopen %s -> %s @ %p\n", sns->lib_path, sns->obj_symbol,
++		(void *)g_sns_obj);
+ 
+ 	if (g_sns_obj->pfn_set_bus_info != NULL) {
+ 		bus.i2c_dev = (td_s8)i2c_bus;
+@@ -514,12 +518,12 @@ static int isp_setup(const Cv610PipelineRuntimeConfig *c)
+ 	 * driver comment warns about. */
+ 	pub.bayer_format    = (ot_isp_bayer_format)c->bayer;
+ 	pub.wdr_mode        = OT_WDR_MODE_NONE;
+-	pub.sns_mode        = 0;
++	pub.sns_mode        = (td_u8)c->sns_mode;
+ 
+ 	/* Tell the ISP which registered 3A libs and which sensor this pipe uses;
+ 	 * without it isp_mem_init cannot resolve the sensor and fails NOT_CFG. */
+ 	memset(&bind, 0, sizeof(bind));
+-	bind.sns_id  = IMX662_SNS_ID;
++	bind.sns_id  = cv610_sensor()->sns_id;
+ 	bind.ae_lib  = g_ae_lib;
+ 	bind.awb_lib = g_awb_lib;
+ 	CV610_CHECK(ss_mpi_isp_set_bind_attr(VI_PIPE, &bind));
+@@ -805,6 +809,7 @@ int cv610_pipeline_start(const Cv610PipelineConfig *config)
+ 	c.data_rate_x2 = config->data_rate_x2;
+ 	c.bayer = config->bayer;
+ 	c.raw_bit = config->raw_bit;
++	c.sns_mode = config->sns_mode;
+ 	c.sensor_clock_hz = config->sensor_clock_hz;
+ 	c.out_width = config->out_width;
+ 	c.out_height = config->out_height;
+diff --git a/src/cv610_runtime.c b/src/cv610_runtime.c
+index 327873a..efb6ffa 100644
+--- a/src/cv610_runtime.c
++++ b/src/cv610_runtime.c
+@@ -2205,12 +2205,13 @@ static int cv610_prepare(void *opaque)
+ 		&ctx->pipeline.out_width, &ctx->pipeline.out_height);
+ 	ctx->pipeline.keep_aspect = cfg->isp.keep_aspect ? 1 : 0;
+ 	ctx->pipeline.fps = mode->fps;
+-	ctx->pipeline.lanes = 4;
++	ctx->pipeline.lanes = cv610_sensor_lane_count(cv610_sensor());
+ 	ctx->pipeline.data_rate_x2 = 0;
+-	ctx->pipeline.bayer = 0;
++	ctx->pipeline.bayer = cv610_sensor()->bayer;
+ 	ctx->pipeline.mirror = cfg->image.mirror ? 1 : 0;
+ 	ctx->pipeline.flip = cfg->image.flip ? 1 : 0;
+ 	ctx->pipeline.raw_bit = (int)mode->raw_bit;
++	ctx->pipeline.sns_mode = mode->sns_mode;
+ 	ctx->pipeline.sensor_clock_hz = mode->sensor_clock_hz;
+ 	/* Match the standalone streamer's production graph. The CV610 module
+ 	 * loader now provides the clean SYS/VB lifecycle required by online VI. */
+@@ -2227,7 +2228,8 @@ static int cv610_prepare(void *opaque)
+ 			cfg->outgoing.server);
+ 		return 1;
+ 	}
+-	printf("> CV610/IMX662 backend selected (initial streaming slice)\n");
++	printf("> CV610/%s backend selected (initial streaming slice)\n",
++		cv610_sensor()->name);
+ 	return 0;
+ }
+ 

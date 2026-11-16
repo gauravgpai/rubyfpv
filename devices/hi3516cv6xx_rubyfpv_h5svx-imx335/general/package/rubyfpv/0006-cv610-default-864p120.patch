@@ -1,0 +1,85 @@
+From: cv610-fpv
+Subject: [PATCH] CV610: default to 120 fps, 1536x864 (864p120), 10 Mbit/s
+
+On the Hi3516CV610 + IMX335 2-lane the default video becomes 1536x864 at
+120 fps, so the camera starts in the imx335_2l_864p120 sensor mode (the
+1536x864 crop, unscaled; patch 0010 adds the size to the resolution list).
+The high quality, high performance and user profiles default to 120 fps
+too, as picking a profile on the controller applies its default fps; long
+range keeps 30. The high quality, user and custom profiles default to
+10 Mbit/s (was SigmaStar's 7): it fits MCS-2 with about 20% EC, and the
+camera's encoder path tops out near 17 Mbit/s. Applies when the vehicle
+settings are reset (first boot, or Ruby resetting them).
+---
+--- a/code/base/config_video.h
++++ b/code/base/config_video.h
+@@ -55,6 +55,7 @@
+ #define DEFAULT_VIDEO_BITRATE 6000000 // in bps
+ #define DEFAULT_VIDEO_BITRATE_PI_ZERO 4000000 // in bps
+ #define DEFAULT_VIDEO_BITRATE_OPIC_SIGMASTAR 7000000
++#define DEFAULT_VIDEO_BITRATE_CV610 10000000 // Hi3516CV610: HQ/user/custom profiles
+ #define DEFAULT_HP_VIDEO_BITRATE 5000000
+ 
+ 
+--- a/code/base/models.cpp
++++ b/code/base/models.cpp
+@@ -2727,6 +2727,14 @@
+       video_params.iVideoFPS = DEFAULT_VIDEO_FPS_OIPC;
+    if ( hardware_board_is_sigmastar(hardware_getBoardType()) || hardware_board_is_hisi_cv610(hardware_getBoardType()) )
+       video_params.iVideoFPS = DEFAULT_VIDEO_FPS_OIPC_SIGMASTAR;
++   // CV610 + IMX335 2-lane: 1536x864 crop at 120 fps (imx335_2l_864p120.ini),
++   // native: 1536x864 is in the OpenIPC resolution list (patch 0010).
++   if ( hardware_board_is_hisi_cv610(hardware_getBoardType()) )
++   {
++      video_params.iVideoWidth = 1536;
++      video_params.iVideoHeight = 864;
++      video_params.iVideoFPS = 120;
++   }
+ 
+    if ( hardware_isCameraVeye() || hardware_isCameraHDMI() )
+    {
+@@ -2888,6 +2896,16 @@
+    {
+       video_link_profiles[iProfile].iDefaultFPS = DEFAULT_VIDEO_FPS_PROFILE_HP;    
+    }
++   // CV610: 120 fps for the high quality, high performance and user profiles
++   // (the 864p120 sensor mode); long range keeps its lower default.
++   if ( hardware_board_is_hisi_cv610(hardware_getBoardType()) )
++   if ( (iProfile == VIDEO_PROFILE_HIGH_QUALITY) || (iProfile == VIDEO_PROFILE_HIGH_PERF) || (iProfile == VIDEO_PROFILE_USER) )
++      video_link_profiles[iProfile].iDefaultFPS = 120;
++   // CV610: 10 Mbit/s for the high quality, user and custom profiles (fits
++   // MCS-2 with ~20% EC; the camera's encoder path tops out near 17 Mbit/s).
++   if ( hardware_board_is_hisi_cv610(hardware_getBoardType()) )
++   if ( (iProfile == VIDEO_PROFILE_HIGH_QUALITY) || (iProfile == VIDEO_PROFILE_USER) || (iProfile == VIDEO_PROFILE_CUST) )
++      video_link_profiles[iProfile].uTargetVideoBitrateBPS = DEFAULT_VIDEO_BITRATE_CV610;
+    //-----------------------------------------------------
+    // Adaptive video & keyframe in openIPC goke cameras is not supported. (majestic bitrate and keyframe can't be changed)
+    
+@@ -4086,6 +4104,14 @@
+          video_params.iVideoFPS = DEFAULT_VIDEO_FPS_OIPC;
+       if ( hardware_board_is_sigmastar(hardware_getBoardType()) || hardware_board_is_hisi_cv610(hardware_getBoardType()) )
+          video_params.iVideoFPS = DEFAULT_VIDEO_FPS_OIPC_SIGMASTAR;
++      // CV610 + IMX335 2-lane: 1536x864 crop at 120 fps (imx335_2l_864p120.ini),
++      // native: 1536x864 is in the OpenIPC resolution list (patch 0010).
++      if ( hardware_board_is_hisi_cv610(hardware_getBoardType()) )
++      {
++         video_params.iVideoWidth = 1536;
++         video_params.iVideoHeight = 864;
++         video_params.iVideoFPS = 120;
++      }
+ 
+       if ( hardware_isCameraVeye() || hardware_isCameraHDMI() )
+       {
+@@ -6472,6 +6498,12 @@
+       video_link_profiles[VIDEO_PROFILE_USER].uTargetVideoBitrateBPS = DEFAULT_VIDEO_BITRATE_OPIC_SIGMASTAR;
+       video_link_profiles[VIDEO_PROFILE_CUST].uTargetVideoBitrateBPS = DEFAULT_VIDEO_BITRATE_OPIC_SIGMASTAR;
+    }
++   if ( hardware_board_is_hisi_cv610(hardware_getBoardType()) )
++   {
++      video_link_profiles[VIDEO_PROFILE_HIGH_QUALITY].uTargetVideoBitrateBPS = DEFAULT_VIDEO_BITRATE_CV610;
++      video_link_profiles[VIDEO_PROFILE_USER].uTargetVideoBitrateBPS = DEFAULT_VIDEO_BITRATE_CV610;
++      video_link_profiles[VIDEO_PROFILE_CUST].uTargetVideoBitrateBPS = DEFAULT_VIDEO_BITRATE_CV610;
++   }
+ 
+    // Lower video bitrate on all video profiles if running on a single core CPU
+    if ( ((board_type & BOARD_TYPE_MASK) == BOARD_TYPE_OPENIPC_GOKE200) || ((board_type & BOARD_TYPE_MASK) == BOARD_TYPE_OPENIPC_GOKE210) ||

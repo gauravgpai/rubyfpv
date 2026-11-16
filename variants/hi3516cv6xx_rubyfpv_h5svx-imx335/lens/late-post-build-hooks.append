@@ -1,0 +1,3 @@
+# Added to general/scripts/late-post-build-hooks.list for this variant
+# (config-symbol:hook-script-relative-path; OpenIPC runs it after the overlay).
+BR2_PACKAGE_RUBYFPV:scripts/post-build-lens.sh

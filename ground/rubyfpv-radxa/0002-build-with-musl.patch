@@ -1,0 +1,31 @@
+From: cv610-fpv
+Subject: [PATCH] Build with musl
+
+musl has no pthread_attr_setaffinity_np, and PTHREAD_STACK_MIN needs
+<limits.h>. Without affinity the thread keeps the default CPU set.
+---
+diff --git a/code/base/hardware_procs.cpp b/code/base/hardware_procs.cpp
+index b41f7df..b430020 100644
+--- a/code/base/hardware_procs.cpp
++++ b/code/base/hardware_procs.cpp
+@@ -6,6 +6,7 @@
+ #include <sys/resource.h>
+ #include <ctype.h>
+ #include <pthread.h>
++#include <limits.h>
+ #include <sched.h>
+ #include <errno.h>
+ #include <sys/uio.h>
+@@ -1549,7 +1550,12 @@ int hw_init_worker_thread_attrs(pthread_attr_t* pAttr, int iDesiredCore, int iSt
+       cpu_set_t cpuSet;
+       CPU_ZERO(&cpuSet);
+       CPU_SET(iDesiredCore, &cpuSet);
++      #if defined(__GLIBC__)
+       iRet = pthread_attr_setaffinity_np(pAttr, sizeof(cpuSet), &cpuSet);
++      #else
++      // musl has no pthread_attr_setaffinity_np; the thread keeps the default affinity.
++      iRet = 0;
++      #endif
+       if ( 0 != iRet )
+          log_softerror_and_alarm("[HWP] Failed to init thread cpu affinity on PID %d (for: %s) to core %d (out of %d cores). Error: %d (%s)", pid, szSource, iDesiredCore, hw_procs_get_cpu_count(), errno, strerror(errno));
+       else

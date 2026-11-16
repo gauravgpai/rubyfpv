@@ -1,0 +1,39 @@
+From: cv610-fpv
+Subject: [PATCH] CV610: pulse the IR-cut coil instead of holding it
+
+0001 drove the IR-cut pins the way Ruby does on the other boards: one
+pin high, the other low, and left there. This camera has a real bistable
+coil across GPIO 1 and 9, so it stayed powered all the time: the coil
+overheated and the SoC ran 10-15 C hotter. Pulse it for 150 ms and set
+both pins low, as the stock firmware does (hw.cfg: ircut_gpio_p = 1,
+ircut_gpio_n = 9, ircut_hold_ms = 150).
+---
+--- a/code/base/hardware_cam_maj.cpp
++++ b/code/base/hardware_cam_maj.cpp
+@@ -883,8 +883,13 @@
+       }
+       if ( hardware_board_is_hisi_cv610(hardware_getBoardType()) )
+       {
+-         _add_maj_command_to_queue_or_exec("gpio set 1", false);
++         // A real bistable IR-cut coil across GPIO 1 (P) and 9 (N): pulse it
++         // and let go, as the stock firmware does (ircut_hold_ms = 150).
++         // Left driven it draws current all the time and heats the camera.
+          _add_maj_command_to_queue_or_exec("gpio clear 9", false);
++         _add_maj_command_to_queue_or_exec("gpio set 1", false);
++         _add_maj_command_to_queue_or_exec("usleep 150000", false);
++         _add_maj_command_to_queue_or_exec("gpio clear 1", false);
+       }
+    }
+    else
+@@ -911,8 +916,10 @@
+       }
+       if ( hardware_board_is_hisi_cv610(hardware_getBoardType()) )
+       {
+-         _add_maj_command_to_queue_or_exec("gpio set 9", false);
+          _add_maj_command_to_queue_or_exec("gpio clear 1", false);
++         _add_maj_command_to_queue_or_exec("gpio set 9", false);
++         _add_maj_command_to_queue_or_exec("usleep 150000", false);
++         _add_maj_command_to_queue_or_exec("gpio clear 9", false);
+       }
+    }
+    }

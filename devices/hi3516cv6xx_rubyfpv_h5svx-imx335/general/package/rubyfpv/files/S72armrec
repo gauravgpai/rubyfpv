@@ -1,0 +1,23 @@
+#!/bin/sh
+#
+# SD card recording while the flight controller is armed (see /usr/sbin/armrec).
+# Runs before S73ruby, which starts majestic, so the recorder settings are in
+# place when majestic reads its config.
+#
+
+case "$1" in
+	start)
+		/usr/sbin/armrec setup
+		start-stop-daemon -S -b -q -x /usr/sbin/armrec -- run
+		;;
+
+	stop)
+		[ -f /var/run/armrec.pid ] && kill "$(cat /var/run/armrec.pid)" 2>/dev/null
+		rm -f /var/run/armrec.pid
+		;;
+
+	*)
+		echo "Usage: $0 {start|stop}"
+		exit 1
+		;;
+esac

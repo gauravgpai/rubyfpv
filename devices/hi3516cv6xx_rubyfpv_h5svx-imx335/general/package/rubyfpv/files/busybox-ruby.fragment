@@ -1,0 +1,6 @@
+# Ruby raises majestic with renice and pins processes with taskset; the
+# stock OpenIPC busybox has neither (sh: renice: not found at every start).
+CONFIG_RENICE=y
+CONFIG_TASKSET=y
+CONFIG_FEATURE_TASKSET_FANCY=y
+CONFIG_FEATURE_TASKSET_CPULIST=y

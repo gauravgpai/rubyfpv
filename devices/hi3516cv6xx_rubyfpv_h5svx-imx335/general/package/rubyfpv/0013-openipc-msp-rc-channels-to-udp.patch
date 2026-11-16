@@ -1,0 +1,67 @@
+From: cv610-fpv
+Subject: [PATCH] OpenIPC: MSP remote-control channels to a local UDP port
+
+With /etc/ruby_msp_rc present, Ruby also asks the flight controller for
+MSP_RC ten times a second and passes the channel values to UDP
+127.0.0.1:5607, where an image's own program (camera select, zoom) reads
+them. Without the file nothing changes.
+---
+--- a/code/r_vehicle/telemetry_msp.cpp
++++ b/code/r_vehicle/telemetry_msp.cpp
+@@ -36,6 +36,17 @@
+ #include "timers.h"
+ #include "../base/ruby_ipc.h"
+ #include "../base/msp.h"
++#include <unistd.h>
++#include <sys/socket.h>
++#include <netinet/in.h>
++
++// Remote-control channels for an image that wants them (/etc/ruby_msp_rc):
++// MSP_RC (105) is requested 10 times a second and the answer, 16-bit
++// little-endian channel values, goes to UDP 127.0.0.1:5607.
++#define MSP_CMD_RC_CHANNELS 105
++static int s_iMSPRCEnabled = -1;
++static u32 s_uMSPLastRequestRCTime = 0;
++static int s_iMSPRCSocket = -1;
+ 
+ void broadcast_vehicle_stats();
+ bool isRadioLinksInitInProgress();
+@@ -213,6 +224,14 @@
+       return;
+    }
+ 
++   if ( s_iMSPRCEnabled < 0 )
++      s_iMSPRCEnabled = (access("/etc/ruby_msp_rc", R_OK) == 0) ? 1 : 0;
++   if ( s_iMSPRCEnabled && (g_TimeNow >= s_uMSPLastRequestRCTime + 100) )
++   {
++      s_uMSPLastRequestRCTime = g_TimeNow;
++      _send_msp_to_fc(MSP_CMD_RC_CHANNELS, NULL, 0);
++   }
++
+    if ( g_TimeNow >= s_uMSPLastRequestBatteryInfoTime + 500 )
+    {
+       s_uMSPLastRequestBatteryInfoTime = g_TimeNow;
+@@ -423,6 +442,23 @@
+ 
+    switch ( s_uMSPCommand )
+    {
++      case MSP_CMD_RC_CHANNELS:
++         if ( s_iMSPCommandPayloadSize >= 2 )
++         {
++            if ( s_iMSPRCSocket < 0 )
++               s_iMSPRCSocket = socket(AF_INET, SOCK_DGRAM, 0);
++            if ( s_iMSPRCSocket >= 0 )
++            {
++               struct sockaddr_in addrRC;
++               memset(&addrRC, 0, sizeof(addrRC));
++               addrRC.sin_family = AF_INET;
++               addrRC.sin_port = htons(5607);
++               addrRC.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
++               sendto(s_iMSPRCSocket, s_uMSPCommandPayload, s_iMSPCommandPayloadSize, MSG_DONTWAIT, (struct sockaddr*)&addrRC, sizeof(addrRC));
++            }
++         }
++         break;
++
+       case MSP_CMD_STATUS:
+        {
+           int iArmed = (s_uMSPCommandPayload[6] & 0x01);

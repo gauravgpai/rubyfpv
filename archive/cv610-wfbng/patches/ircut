@@ -1,0 +1,30 @@
+#!/bin/sh
+# IR-cut filter on the H5SVX (Hi3516CV610-20S + IMX335) board.
+# Pins from the stock firmware's hw.cfg: ircut_gpio_p = GPIO1 (GPIO0_1),
+# ircut_gpio_n = GPIO9 (GPIO1_1), both active-high, 150 ms pulse.
+# day = pulse P (filter in), night = pulse N (filter out).
+P=1
+N=9
+HOLD_US=150000
+
+setup()
+{
+	for g in $P $N; do
+		[ -d /sys/class/gpio/gpio$g ] || echo $g > /sys/class/gpio/export
+		echo out > /sys/class/gpio/gpio$g/direction
+		echo 0 > /sys/class/gpio/gpio$g/value
+	done
+}
+
+pulse()
+{
+	echo 1 > /sys/class/gpio/gpio$1/value
+	usleep $HOLD_US
+	echo 0 > /sys/class/gpio/gpio$1/value
+}
+
+case "$1" in
+	day) setup; pulse $P ;;
+	night) setup; pulse $N ;;
+	*) echo "Usage: $0 {day|night}" >&2; exit 1 ;;
+esac

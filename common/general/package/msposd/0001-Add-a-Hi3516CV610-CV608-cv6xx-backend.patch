@@ -1,0 +1,3844 @@
+From fb2139b2141d3a9cf3b9686ca7ddb469ce2d52a4 Mon Sep 17 00:00:00 2001
+From: gauravgpai <gauravgpai300@gmail.com>
+Date: Fri, 30 Oct 2026 14:34:59 +0100
+Subject: [PATCH] Add a Hi3516CV610/CV608 (cv6xx) backend
+
+The cv6xx SoCs use HiSilicon SDK V5, which renames the V4 region API msposd
+already drives on hi3516ev300 to ss_mpi_rgn_* with ot_* types. The new target
+builds the GOKE render path (one ARGB1555 overlay on VENC channel 0) and only
+swaps the SDK calls in bmp/region.c. VENC overlay alpha runs to 255 on V5.
+
+sdk/hi3516cv6xx/include holds the nine headers ss_mpi_region.h pulls in, from
+openhisilicon b0d848e.
+
+Built with the OpenIPC musl toolchain and linked against the
+hisilicon-osdrv-hi3516cv6xx libraries; not yet run on hardware.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ Makefile                                   |    8 +-
+ bmp/common.h                               |   10 +
+ bmp/region.c                               |   75 +-
+ sdk/hi3516cv6xx/include/autoconf.h         |  490 +++++++
+ sdk/hi3516cv6xx/include/ot_common.h        |  392 +++++
+ sdk/hi3516cv6xx/include/ot_common_region.h |  221 +++
+ sdk/hi3516cv6xx/include/ot_common_video.h  | 1528 ++++++++++++++++++++
+ sdk/hi3516cv6xx/include/ot_debug.h         |  191 +++
+ sdk/hi3516cv6xx/include/ot_defines.h       |  555 +++++++
+ sdk/hi3516cv6xx/include/ot_errno.h         |   96 ++
+ sdk/hi3516cv6xx/include/ot_type.h          |   73 +
+ sdk/hi3516cv6xx/include/ss_mpi_region.h    |   45 +
+ 12 files changed, 3682 insertions(+), 2 deletions(-)
+ create mode 100644 sdk/hi3516cv6xx/include/autoconf.h
+ create mode 100644 sdk/hi3516cv6xx/include/ot_common.h
+ create mode 100644 sdk/hi3516cv6xx/include/ot_common_region.h
+ create mode 100644 sdk/hi3516cv6xx/include/ot_common_video.h
+ create mode 100644 sdk/hi3516cv6xx/include/ot_debug.h
+ create mode 100644 sdk/hi3516cv6xx/include/ot_defines.h
+ create mode 100644 sdk/hi3516cv6xx/include/ot_errno.h
+ create mode 100644 sdk/hi3516cv6xx/include/ot_type.h
+ create mode 100644 sdk/hi3516cv6xx/include/ss_mpi_region.h
+
+diff --git a/Makefile b/Makefile
+index b72eeb1..e96b8db 100644
+--- a/Makefile
++++ b/Makefile
+@@ -20,7 +20,7 @@ version.h:
+ all: version.h
+ 
+ clean:
+-	rm -f *.o msposd msposd_goke msposd_hisi msposd_star6b0 msposd_star6e msposd_rockchip
++	rm -f *.o msposd msposd_goke msposd_hisi msposd_star6b0 msposd_star6e msposd_cv6xx msposd_rockchip
+ 
+ goke: version.h
+ 	$(eval SDK = ./sdk/gk7205v300)
+@@ -40,6 +40,12 @@ hi3536: version.h
+ 	$(eval LIB = -lm)
+ 	$(BUILD)
+ 
++cv6xx: version.h
++	$(eval SDK = ./sdk/hi3516cv6xx)
++	$(eval CFLAGS += -D__GOKE__ -D__CV6XX__)
++	$(eval LIB = -lss_mpi -lss_mpi_sysmem -lsecurec -lm)
++	$(BUILD)
++
+ star6b0: version.h
+ 	$(eval SDK = ./sdk/infinity6)
+ 	$(eval CFLAGS += -D__SIGMASTAR__ -D__INFINITY6__ -D__INFINITY6B0__)
+diff --git a/bmp/common.h b/bmp/common.h
+index 3fb5fe4..62cffc6 100644
+--- a/bmp/common.h
++++ b/bmp/common.h
+@@ -50,6 +50,16 @@ extern "C" {
+ #define PIXEL_FORMAT_8888 PIX_FMT_ARGB
+ #define PIXEL_FORMAT_I4 E_MI_RGN_PIXEL_FORMAT_I4
+ 
++#elif defined(__CV6XX__)
++// Hi3516CV610/CV608: SDK V5 renamed the V4 region API to ss_mpi_rgn_* with ot_* types
++#include "ss_mpi_region.h"
++
++#define PIXEL_FORMAT_4444 OT_PIXEL_FORMAT_ARGB_4444
++#define PIXEL_FORMAT_1555 OT_PIXEL_FORMAT_ARGB_1555
++#define PIXEL_FORMAT_2BPP OT_PIXEL_FORMAT_ARGB_2BPP
++#define PIXEL_FORMAT_8888 OT_PIXEL_FORMAT_ARGB_8888
++#define PIXEL_FORMAT_I4 3 // Not used, as on GOKE: the overlay is ARGB1555
++
+ #elif __HI3536__
+ #include "hi_common.h"
+ #include "hi_math.h"
+diff --git a/bmp/region.c b/bmp/region.c
+index d4dea27..6e50a69 100644
+--- a/bmp/region.c
++++ b/bmp/region.c
+@@ -211,6 +211,67 @@ static void hifb_close(void) {
+ }
+ #endif
+ 
++#ifdef __CV6XX__
++// Same scheme as the HiSilicon V4 path below: one ARGB1555 overlay attached to
++// VENC channel 0, in the SDK V5 names. VENC overlay alpha runs to 255 here, not 128.
++static const ot_mpp_chn cv6xx_venc = {OT_ID_VENC, 0, 0};
++
++static int cv6xx_create_region(int handle, int x, int y, int width, int height) {
++	ot_rgn_attr stRegion, stRegionCurrent;
++	ot_rgn_chn_attr stChnAttr, stChnAttrCurrent;
++
++	memset(&stRegion, 0, sizeof(stRegion));
++	stRegion.type = OT_RGN_OVERLAY;
++	stRegion.attr.overlay.pixel_format = PIXEL_FORMAT_1555;
++	stRegion.attr.overlay.bg_color = 0x7fff;
++	stRegion.attr.overlay.size.width = width;
++	stRegion.attr.overlay.size.height = height;
++	stRegion.attr.overlay.canvas_num = 2;
++
++	int s32Ret = ss_mpi_rgn_get_attr(handle, &stRegionCurrent);
++	if (!s32Ret && (stRegionCurrent.attr.overlay.size.width != width ||
++					   stRegionCurrent.attr.overlay.size.height != height)) {
++		fprintf(stderr, "[%s:%d] Region parameters are different, recreating ... \n", __func__,
++			__LINE__);
++		ss_mpi_rgn_detach_from_chn(handle, &cv6xx_venc);
++		ss_mpi_rgn_destroy(handle);
++		s32Ret = -1;
++	}
++	if (s32Ret) {
++		if (verbose)
++			fprintf(stderr, "[%s:%d]RGN_GetAttr failed with %#x , creating region %d...\n",
++				__func__, __LINE__, s32Ret, handle);
++		s32Ret = ss_mpi_rgn_create(handle, &stRegion);
++		if (s32Ret) {
++			fprintf(stderr, "[%s:%d]RGN_Create failed with %#x!\n", __func__, __LINE__, s32Ret);
++			return -1;
++		}
++	}
++
++	if (!ss_mpi_rgn_get_chn_display_attr(handle, &cv6xx_venc, &stChnAttrCurrent)) {
++		if (stChnAttrCurrent.attr.overlay_chn.point.x == x &&
++			stChnAttrCurrent.attr.overlay_chn.point.y == y)
++			return 0;
++		ss_mpi_rgn_detach_from_chn(handle, &cv6xx_venc);
++	}
++
++	memset(&stChnAttr, 0, sizeof(stChnAttr));
++	stChnAttr.is_show = TD_TRUE;
++	stChnAttr.type = OT_RGN_OVERLAY;
++	stChnAttr.attr.overlay_chn.point.x = x;
++	stChnAttr.attr.overlay_chn.point.y = y;
++	stChnAttr.attr.overlay_chn.bg_alpha = 0;
++	stChnAttr.attr.overlay_chn.fg_alpha = OT_RGN_OVERLAY_VENC_MAX_ALPHA;
++	stChnAttr.attr.overlay_chn.layer = 7;
++	stChnAttr.attr.overlay_chn.qp_info.enable = TD_FALSE;
++	stChnAttr.attr.overlay_chn.dst = OT_RGN_ATTACH_JPEG_MAIN;
++
++	s32Ret = ss_mpi_rgn_attach_to_chn(handle, &cv6xx_venc, &stChnAttr);
++	if (s32Ret)
++		fprintf(stderr, "[%s:%d]RGN_AttachToChn failed with %#x!\n", __func__, __LINE__, s32Ret);
++	return s32Ret;
++}
++#endif
+ 
+ 
+ int InitRGN_SigmaStar(){
+@@ -250,7 +311,10 @@ int create_region(int *handle, int x, int y, int width, int height) {
+ 	fb_y = y < 0 ? 0 : y;
+ 	return 0;
+ #endif
+-#if !defined(_x86) && !defined(__ROCKCHIP__) && !defined(__HI3536__)
++#ifdef __CV6XX__
++	return cv6xx_create_region(*handle, x, y, width, height);
++#endif
++#if !defined(_x86) && !defined(__ROCKCHIP__) && !defined(__HI3536__) && !defined(__CV6XX__)
+ #ifdef __SIGMASTAR__
+ 	MI_RGN_ChnPort_t stChn;
+ 
+@@ -568,6 +632,9 @@ int set_bitmap(int handle, BITMAP *bitmap) {
+ #if !defined(_x86) && !defined(__ROCKCHIP__) && !defined(__HI3536__)
+ #ifdef __SIGMASTAR__
+ 	s32Ret = MI_RGN_SetBitMap(DEV handle, (MI_RGN_Bitmap_t *)(bitmap));
++#elif defined(__CV6XX__)
++	ot_bmp stBitmap = {bitmap->enPixelFormat, bitmap->u32Width, bitmap->u32Height, bitmap->pData};
++	s32Ret = ss_mpi_rgn_set_bmp(handle, &stBitmap);
+ #elif __GOKE__
+ 	s32Ret = HI_MPI_RGN_SetBitMap(handle, (BITMAP_S *)(bitmap));
+ #endif
+@@ -658,6 +725,12 @@ int unload_region(int *handle) {
+ 	if (s32Ret)
+ 		fprintf(stderr, "[%s:%d]RGN_Destroy failed with %#x %d!\n", __func__, __LINE__, s32Ret,
+ 			*handle);
++#elif defined(__CV6XX__)
++	ss_mpi_rgn_detach_from_chn(*handle, &cv6xx_venc);
++	s32Ret = ss_mpi_rgn_destroy(*handle);
++	if (s32Ret)
++		fprintf(stderr, "[%s:%d]RGN_Destroy failed with %#x %d!\n", __func__, __LINE__, s32Ret,
++			*handle);
+ #elif __GOKE__
+ 	MPP_CHN_S stChn;
+ 	stChn.s32DevId = 0;
+diff --git a/sdk/hi3516cv6xx/include/autoconf.h b/sdk/hi3516cv6xx/include/autoconf.h
+new file mode 100644
+index 0000000..4c51c4a
+--- /dev/null
++++ b/sdk/hi3516cv6xx/include/autoconf.h
+@@ -0,0 +1,490 @@
++/*
++  Copyright (c), 2001-2025, Shenshu Tech. Co., Ltd.
++ */
++#ifndef __AUTOCONF_H__
++#define __AUTOCONF_H__
++
++#define AUTOCONF_TIMESTAMP "2025-04-16 20:06:53 CST"
++
++/*
++ * General Setup
++ */
++#define CONFIG_HI3516CV610 1
++#define CONFIG_OT_CHIP_TYPE 0x3516c610
++#define CONFIG_OT_ARCH "hi3516cv610"
++#define CONFIG_SUBCHIP_HI3516CV610 1
++#define CONFIG_OT_SUBARCH "hi3516cv610"
++#define CONFIG_OT_SUBCHIP_TYPE 0x3516c610
++#define CONFIG_SMP 1
++#define CONFIG_ARM_ARCH_TYPE "smp"
++#define CONFIG_A7 1
++#define CONFIG_CPU_TYPE "a7"
++#define CONFIG_VERSION_ASIC 1
++#define CONFIG_LINUX_OS 1
++#define CONFIG_OS_TYPE "linux"
++#define CONFIG_KERNEL_SPACE 1
++#define CONFIG_DRIVER_SPACE_TYPE "kernel_space"
++#define CONFIG_GCC 1
++#define CONFIG_LINUX_5_10_y 1
++#define CONFIG_KERNEL_VERSION "linux-5.10.y"
++#define CONFIG_KERNEL_ARM_V01C02_LINUX_MUSLEABI 1
++#define CONFIG_OT_CROSS "arm-v01c02-linux-musleabi-"
++#define CONFIG_LIBC_TYPE "musl"
++#define CONFIG_KERNEL_BIT "KERNEL_BIT_32"
++#define CONFIG_USER_ARM_V01C02_LINUX_MUSLEABI 1
++#define CONFIG_OT_CROSS_LIB "arm-v01c02-linux-musleabi-"
++#define CONFIG_USER_BIT "USER_BIT_32"
++#define CONFIG_RELEASE_TYPE_RELEASE 1
++#define CONFIG_OT_RLS_MODE "OT_RELEASE"
++
++/*
++ * Media Modules Setup
++ */
++
++/*
++ * media audio config
++ */
++#define CONFIG_OT_AUDIO_SUPPORT 1
++#define CONFIG_OT_ACODEC_SUPPORT 1
++#define CONFIG_OT_ACODEC_VERSION "V752"
++#define CONFIG_OT_ACODEC_MAX_GAIN 50
++#define CONFIG_OT_ACODEC_MIN_GAIN 0
++#define CONFIG_OT_ACODEC_GAIN_STEP 2
++#define CONFIG_OT_ACODEC_FAST_POWER_SUPPORT 1
++#define CONFIG_OT_DOWNVQE_SUPPORT 1
++#define CONFIG_OT_TALKVQE_SUPPORT 1
++#define CONFIG_OT_RECORDVQE_SUPPORT 1
++#define CONFIG_OT_TALKVQEV2_SUPPORT 1
++#define CONFIG_OT_TALKVQEV2_WNR_SUPPORT 1
++#define CONFIG_OT_AUDIO_STATIC_REGISTER_SUPPORT 1
++#define CONFIG_OT_AUDIO_BCD_SUPPORT 1
++#define CONFIG_OT_AUDIO_BCD_V2_SUPPORT 1
++#define CONFIG_OT_AENC_SUPPORT 1
++#define CONFIG_OT_AENC_AAC_SUPPORT 1
++#define CONFIG_OT_AENC_MP3_SUPPORT 1
++#define CONFIG_OT_AENC_OPUS_SUPPORT 1
++#define CONFIG_OT_ADEC_SUPPORT 1
++#define CONFIG_OT_ADEC_AAC_SUPPORT 1
++#define CONFIG_OT_ADEC_MP3_SUPPORT 1
++#define CONFIG_OT_ADEC_OPUS_SUPPORT 1
++
++/*
++ * media base config
++ */
++
++/*
++ * media vb config
++ */
++#define CONFIG_OT_VB_EXTPOOL_SUPPORT 1
++#define CONFIG_OT_VB_SUPPLEMENT_MASK_SUPPORT 1
++
++/*
++ * media vca config
++ */
++#define CONFIG_OT_VCA_SUPPORT 1
++
++/*
++ * media chnl config
++ */
++#define CONFIG_OT_CHNL_SUPPORT 1
++
++/*
++ * media dis config
++ */
++
++/*
++ * media gdc config
++ */
++
++/*
++ * media hdmi config
++ */
++
++/*
++ * media isp config
++ */
++#define CONFIG_OT_ISP_SUPPORT 1
++#define CONFIG_OT_ISP_AF_SUPPORT 1
++#define CONFIG_OT_ISP_CR_SUPPORT 1
++#define CONFIG_OT_ISP_USER_BLC_SUPPORT 1
++#define CONFIG_OT_ISP_GCAC_SUPPORT 1
++#define CONFIG_OT_ISP_CA_SUPPORT 1
++#define CONFIG_OT_ISP_SPECAWB_SUPPORT 1
++#define CONFIG_OT_ISP_COLOR_SECTOR_SUPPORT 1
++#define CONFIG_OT_ISP_DRC_SWITCH_SUPPORT 1
++#define CONFIG_OT_AIISP_SUPPORT 1
++#define CONFIG_OT_AIBNR_SUPPORT 1
++#define CONFIG_OT_ISP_AGAMMA_SUPPORT 1
++
++/*
++ * media region config
++ */
++#define CONFIG_OT_REGION_SUPPORT 1
++#define CONFIG_OT_RGN_VGS_QUICKCOPY_SUPPORT 1
++#define CONFIG_OT_RGN_CORNER_RECT_SUPPORT 1
++#define CONFIG_OT_RGN_CORNER_RECT_SUPPORT_ACT_COVER 1
++#define CONFIG_OT_RGN_PIXEL_CLUT_MULTI_MAPPING 1
++
++/*
++ * media sys config
++ */
++#define CONFIG_OT_SYS_SUPPORT 1
++#define CONFIG_OT_SYS_SCALE_COEF_SUPPORT 1
++#define CONFIG_OT_SYS_VPSS_VENC_WRAP_SUPPORT 1
++#define CONFIG_SYS_CLK_CTRL_SUPPORT 1
++#define CONFIG_OT_SYS_VI_WRAP_SUPPORT 1
++#define CONFIG_OT_SYS_MEM_SEL_SUPPORT 1
++#define CONFIG_OT_SYS_KOL_SUPPORT 1
++
++/*
++ * media tde config
++ */
++
++/*
++ * media vda config
++ */
++
++/*
++ * media vdec config
++ */
++#define CONFIG_VDEC_IP ""
++
++/*
++ * media venc config
++ */
++#define CONFIG_OT_VENC_SUPPORT 1
++#define CONFIG_OT_VENC_KERNEL_VERSION 1
++#define CONFIG_OT_H265E_SUPPORT 1
++#define CONFIG_OT_H265E_USERDATA_SUPPORT 1
++#define CONFIG_OT_H265E_INTRA_REFRESH_SUPPORT 1
++#define CONFIG_OT_H264E_SUPPORT 1
++#define CONFIG_OT_H264E_USERDATA_SUPPORT 1
++#define CONFIG_OT_H264E_INTRA_REFRESH_SUPPORT 1
++#define CONFIG_OT_SVAC3E_SUPPORT 1
++#define CONFIG_OT_JPEGE_SUPPORT 1
++#define CONFIG_OT_JPEGE_ROI_SUPPORT 1
++#define CONFIG_OT_MJPEGE_SUPPORT 1
++#define CONFIG_OT_JPEGE_DCF_SUPPORT 1
++#define CONFIG_OT_JPEGE_USERDATA_SUPPORT 1
++#define CONFIG_OT_VENC_LOWDELAY_SUPPORT 1
++#define CONFIG_OT_VENC_FRAMEBUF_RECYCLE_SUPPORT 1
++#define CONFIG_OT_VENC_VGS_SUPPORT 1
++#define CONFIG_OT_VENC_SVC_SUPPORT 1
++#define CONFIG_OT_VENC_SVC_V2_SUPPORT 1
++#define CONFIG_OT_VENC_SMARTP_SUPPORT 1
++#define CONFIG_OT_VENC_DUALP_SUPPORT 1
++#define CONFIG_OT_VENC_SINGLESP_SUPPORT 1
++#define CONFIG_OT_VENC_RCNREF_SHARE_SUPPORT 1
++#define CONFIG_OT_VENC_DEBREATH_SUPPORT 1
++#define CONFIG_OT_VENC_SKIPREF_SUPPORT 1
++#define CONFIG_OT_VENC_SCENE0_SUPPORT 1
++#define CONFIG_OT_VENC_SCENE1_SUPPORT 1
++#define CONFIG_OT_VENC_SCENE2_SUPPORT 1
++#define CONFIG_OT_RC_AVBR_SUPPORT 1
++#define CONFIG_OT_RC_QPMAP_SUPPORT 1
++#define CONFIG_OT_RC_QVBR_SUPPORT 1
++#define CONFIG_OT_RC_CVBR_SUPPORT 1
++#define CONFIG_OT_VENC_COMPOSITE_SUPPORT 1
++#define CONFIG_OT_VENC_OUT_ZME_SUPPORT 1
++#define CONFIG_OT_VENC_OTP_PERF_SUPPORT 1
++
++/*
++ * media vgs config
++ */
++#define CONFIG_OT_VGS_SUPPORT 1
++#define CONFIG_OT_VGS_LUMA_STAT_SUPPORT 1
++#define CONFIG_OT_VGS_CORNER_RECT_SUPPORT 1
++#define CONFIG_OT_VGS_CONVERT_CORNER_RECT_TO_LINE_SUPPORT 1
++#define CONFIG_OT_VGS_LOW_DELAY_SUPPORT 1
++#define CONFIG_OT_VGS_INPUT_LOW_DELAY_SUPPORT 1
++#define CONFIG_OT_VGS_LDC_SUPPORT 1
++#define CONFIG_OT_VGS_DMA_SUPPORT 1
++
++/*
++ * media vi config
++ */
++#define CONFIG_OT_VI_SUPPORT 1
++#define CONFIG_OT_VI_ALL_SUPPORT 1
++#define CONFIG_OT_VI_DEV_GENERATE_TIMING 1
++#define CONFIG_OT_VI_DEV_GENERATE_DATA 1
++#define CONFIG_OT_VI_VIRT_PIPE 1
++#define CONFIG_OT_VI_PIPE_POST_CROP 1
++#define CONFIG_OT_VI_PIPE_DUMP_FRAME 1
++#define CONFIG_OT_VI_PIPE_SEND_FRAME 1
++#define CONFIG_OT_VI_PIPE_INTERRUPT_EN 1
++#define CONFIG_OT_VI_PIPE_LOW_DELAY 1
++#define CONFIG_OT_VI_PIPE_FRAME_INTERRUPT_TYPE 1
++#define CONFIG_OT_VI_PIPE_GET_COMPRESS_PARAM 1
++#define CONFIG_OT_VI_PIPE_USER_PIC 1
++#define CONFIG_OT_VI_PIPE_SPLIT_CMP 1
++#define CONFIG_OT_VI_PIPE_FPN 1
++#define CONFIG_OT_VI_PIPE_BNR 1
++#define CONFIG_OT_VI_PIPE_BNR_PURE_MODE 1
++#define CONFIG_OT_VI_PIPE_VNR 1
++#define CONFIG_OT_VI_PIPE_VNR_STT 1
++#define CONFIG_OT_VI_PIPE_ONLINE_CLK_SEL 1
++#define CONFIG_OT_VI_CHN_LOW_DELAY 1
++#define CONFIG_OT_VI_CHN_ROTATION 1
++#define CONFIG_OT_VI_CHN_LDC 1
++#define CONFIG_OT_VI_EXT_CHN 1
++#define CONFIG_OT_VI_DISTRIBUTE_GRP 1
++#define CONFIG_OT_VI_PTS 1
++
++/*
++ * media vo config
++ */
++
++/*
++ * media vpss config
++ */
++#define CONFIG_OT_VPSS_SUPPORT 1
++
++/*
++ * vpss online config
++ */
++#define CONFIG_OT_VPSS_VIPROC_VPSS_ONLINE_SUPPORT 1
++#define CONFIG_OT_VPSS_ONLINE_SUPPORT 1
++#define CONFIG_OT_VPSS_SLAVE_SUPPORT 1
++
++/*
++ * vpss 3dnr config
++ */
++
++/*
++ * vpss rgn config
++ */
++
++/*
++ * vpss grp rgn config
++ */
++#define CONFIG_OT_VPSS_CORNER_RECT_SUPPORT 1
++
++/*
++ * vpss chn rgn config
++ */
++#define CONFIG_OT_VPSS_RGN_ON_CHN_SUPPORT 1
++#define CONFIG_OT_VPSS_COVER_SUPPORT 1
++#define CONFIG_OT_VPSS_COVER_RECT_SUPPORT 1
++#define CONFIG_OT_VPSS_COVER_HOLLOW_SUPPORT 1
++#define CONFIG_OT_VPSS_BUFFER_REUSE_SUPPORT 1
++#define CONFIG_OT_VPSS_LOW_DELAY_SUPPORT 1
++#define CONFIG_OT_VPSS_EXT_CHN_SUPPORT 1
++#define CONFIG_OT_VPSS_CHN_CROP_SUPPORT 1
++#define CONFIG_OT_VPSS_CHN_STRIDE_ALIGN_SUPPORT 1
++
++/*
++ * vpss gdc config
++ */
++#define CONFIG_OT_VPSS_GDC_SUPPORT 1
++
++/*
++ * vpss grp gdc config
++ */
++
++/*
++ * vpss chn gdc config
++ */
++#define CONFIG_OT_VPSS_CHN_GDC_SUPPORT 1
++#define CONFIG_OT_VPSS_CHN_LDC_SUPPORT 1
++#define CONFIG_OT_VPSS_CHN_LDC_V3_SUPPORT 1
++#define CONFIG_OT_VPSS_GRP_SVC_SUPPORT 1
++
++/*
++ * media vpp config
++ */
++#define CONFIG_OT_VPP_SUPPORT 1
++#define CONFIG_OT_VPP_VI_SUPPORT 1
++#define CONFIG_OT_VPP_COVEREX_RATIO_SUPPORT 1
++#define CONFIG_OT_VPP_CHN_ROTATION_SUPPORT 1
++
++/*
++ * media dcc config
++ */
++
++/*
++ * media security_subsys Config
++ */
++#define CONFIG_OT_SECURITY_SUBSYS_SUPPORT 1
++#define CONFIG_OT_CIPHER_SUPPORT 1
++#define CONFIG_HASH_SUPPORT 1
++#define CONFIG_HASH_PBKDF2_SUPPORT 1
++#define CONFIG_HASH_CLONE_SUPPORT 1
++#define CONFIG_SYMC_SUPPORT 1
++#define CONFIG_SYMC_CCM_SUPPORT 1
++#define CONFIG_SYMC_GCM_SUPPORT 1
++#define CONFIG_SYMC_CMAC_SUPPORT 1
++#define CONFIG_SYMC_CBC_MAC_SUPPORT 1
++#define CONFIG_PKE_ECC_SUPPORT 1
++#define CONFIG_PKE_ECC_GEN_KEY_SUPPORT 1
++#define CONFIG_PKE_ECC_ECDH_SUPPORT 1
++#define CONFIG_PKE_ECC_ECDSA_SIGN_SUPPORT 1
++#define CONFIG_PKE_ECC_ECDSA_VERIFY_SUPPORT 1
++#define CONFIG_PKE_ECC_CHECK_DOT_ON_CURVE_SUPPORT 1
++#define CONFIG_PKE_ECC_SM2_DSA_HASH_SUPPORT 1
++#define CONFIG_PKE_ECC_SM2_PUB_ENC_SUPPORT 1
++#define CONFIG_PKE_ECC_SM2_PRIV_DEC_SUPPORT 1
++#define CONFIG_PKE_RSA_SUPPORT 1
++#define CONFIG_PKE_RSA_SIGN_SUPPORT 1
++#define CONFIG_PKE_RSA_VERIFY_SUPPORT 1
++#define CONFIG_PKE_RSA_PUB_ENC_SUPPORT 1
++#define CONFIG_PKE_RSA_PRIV_DEC_SUPPORT 1
++#define CONFIG_PKE_MOD_SUPPORT 1
++#define CONFIG_PKE_EXP_MOD_SUPPORT 1
++#define CONFIG_TRNG_GET_RANDOM_SUPPORT 1
++#define CONFIG_TRNG_GET_MULTI_RANDOM_SUPPORT 1
++#define CONFIG_OT_KM_SUPPORT 1
++#define CONFIG_KM_CLEAR_KEY_SUPPORT 1
++#define CONFIG_KM_EFFECTIVE_KEY_SUPPORT 1
++#define CONFIG_OT_OTP_SUPPORT 1
++#define CONFIG_OT_MBEDTLS_HARDEN_SUPPORT 1
++#define CONFIG_OT_CRYPTODEV_HARDEN_SUPPORT 1
++
++/*
++ * media gfbg Config
++ */
++
++/*
++ * media ot_syslink Config
++ */
++
++/*
++ * media pciv Config
++ */
++
++/*
++ * media avs lut Config
++ */
++
++/*
++ * media avs convert Config
++ */
++
++/*
++ * media pos_query Config
++ */
++
++/*
++ * media snap Config
++ */
++
++/*
++ * media photo Config
++ */
++
++/*
++ * media heif Config
++ */
++
++/*
++ * media svp Config
++ */
++#define CONFIG_OT_SVP_SUPPORT 1
++#define CONFIG_OT_SVP_IVE_NPU 1
++#define CONFIG_OT_SVP_IVE_CSC 1
++#define CONFIG_OT_SVP_IVE_NCC 1
++#define CONFIG_OT_SVP_IVE_LBP 1
++#define CONFIG_OT_SVP_IVE_NORM_GRAD 1
++#define CONFIG_OT_SVP_IVE_ST_CANDI_CORNER 1
++#define CONFIG_OT_SVP_IVE_RESIZE 1
++#define CONFIG_OT_SVP_IVE_PERSP_TRANS 1
++#define CONFIG_OT_SVP_MD 1
++#define CONFIG_OT_SVP_NPU_V2R2 1
++#define CONFIG_OT_SVP_NPU_V2R2_MAC_RATIO 1
++#define CONFIG_OT_SVP_NPU_V2R2_SRAM_REUSE 1
++#define CONFIG_OT_SVP_NPU_V2R2_AIPP_OUTPUT 1
++#define CONFIG_OT_SVP_NPU_V2R2_STREAM_BIND_CONTEXT 1
++
++/*
++ * media motionfusion config
++ */
++
++/*
++ * media mcf Config
++ */
++
++/*
++ * media mipirx config
++ */
++#define CONFIG_OT_MIPIRX_SUPPORT 1
++#define CONFIG_OT_MIPIRX_SUPPORT_DATA_TYPE_RAW_8BIT 1
++#define CONFIG_OT_MIPIRX_SUPPORT_DATA_TYPE_RAW_10BIT 1
++#define CONFIG_OT_MIPIRX_SUPPORT_DATA_TYPE_RAW_12BIT 1
++#define CONFIG_OT_MIPIRX_SUPPORT_DATA_TYPE_RAW_14BIT 1
++#define CONFIG_OT_MIPIRX_SUPPORT_DATA_TYPE_YUV420_8BIT_NORMAL 1
++#define CONFIG_OT_MIPIRX_SUPPORT_DATA_TYPE_YUV422_8BIT 1
++#define CONFIG_OT_MIPIRX_LVDS_SUPPORT 1
++#define CONFIG_OT_MIPIRX_DEBUG_CMD_SUPPORT 1
++#define CONFIG_OT_MIPIRX_FULL_PROC 1
++
++/*
++ * media securec Config
++ */
++#define CONFIG_OT_SECUREC_SUPPORT 1
++
++/*
++ * media irq config
++ */
++
++/*
++ * media proc config
++ */
++#define CONFIG_OT_PROC_SUPPORT 1
++
++/*
++ * media uvc config
++ */
++#define CONFIG_OT_UVC_SUPPORT 1
++
++/*
++ * media smmz agent config
++ */
++
++/*
++ * media pm Config
++ */
++#define CONFIG_OT_PM_SUPPORT 1
++#define CONFIG_OT_PM_TEMP_COMP_SUPPORT 1
++
++/*
++ * media devstat config
++ */
++#define CONFIG_OT_DEVSTAT_SUPPORT 1
++
++/*
++ * media bla config
++ */
++#define CONFIG_OT_BLA_SUPPORT 1
++
++/*
++ * Device Driver Setup
++ */
++
++/*
++ * drv config
++ */
++#define CONFIG_DRV 1
++#define CONFIG_EXTDRV 1
++#define CONFIG_INTERDRV 1
++#define CONFIG_OT_USER 1
++#define CONFIG_MIPI_RX 1
++#define CONFIG_OT_ADC 1
++#define CONFIG_OT_LSADC 1
++#define CONFIG_OT_WDG 1
++#define CONFIG_OT_SYSCFG 1
++
++/*
++ * Debug Config
++ */
++
++/*
++ * GDB  config
++ */
++#define CONFIG_OT_GDB_NO 1
++#define CONFIG_OT_GDB "n"
++#define CONFIG_OT_PROC_SHOW_SUPPORT 1
++#define CONFIG_OT_LOG_TRACE_SUPPORT 1
++#define CONFIG_OT_LOG_TRACE_ALL 1
++#define CONFIG_OT_LOG_TRACE_LEVEL 7
++
++#endif /* __AUTOCONF_H__ */
++
+diff --git a/sdk/hi3516cv6xx/include/ot_common.h b/sdk/hi3516cv6xx/include/ot_common.h
+new file mode 100644
+index 0000000..bb7a349
+--- /dev/null
++++ b/sdk/hi3516cv6xx/include/ot_common.h
+@@ -0,0 +1,392 @@
++/*
++  Copyright (c), 2001-2025, Shenshu Tech. Co., Ltd.
++ */
++
++#ifndef OT_COMMON_H
++#define OT_COMMON_H
++
++#include "autoconf.h"
++#include "ot_type.h"
++#include "ot_defines.h"
++
++#ifdef __cplusplus
++#if __cplusplus
++extern "C" {
++#endif
++#endif /* end of #ifdef __cplusplus */
++
++#ifndef VER_X
++#define VER_X                  1
++#endif
++
++#ifndef VER_Y
++#define VER_Y                  0
++#endif
++
++#ifndef VER_Z
++#define VER_Z                  0
++#endif
++
++#ifndef VER_P
++#define VER_P                  0
++#endif
++
++#ifndef VER_B
++#define VER_B                  0
++#endif
++
++#ifdef OT_DEBUG
++#define VER_D                  " Debug"
++#else
++#define VER_D                  " Release"
++#endif
++
++#define ATTRIBUTE              __attribute__((aligned(OT_ALIGN_NUM)))
++#define ot_unused(x)             ((td_void)(x))
++
++#define OT_COMPAT_POINTER(ptr, type) \
++    do { \
++        td_u32 dest_addr_ = (td_u32)(td_uintptr_t)(ptr); \
++        ptr = (type)(td_uintptr_t)dest_addr_; \
++    } while (0)
++
++#define __MK_VERSION(x, y, z, p, b) #x "." #y "." #z "." #p " B0" #b
++#define MK_VERSION(x, y, z, p, b) __MK_VERSION(x, y, z, p, b)
++#define OT_MPP_VERSION            OT_CHIP_NAME OT_MPP_VER_PRIX MK_VERSION(VER_X, VER_Y, VER_Z, VER_P, VER_B) VER_D
++
++#define OT_MAX_VERSION_NAME_LEN    96
++#define OT_INVALID_CHN         (-1)
++#define OT_INVALID_WAY         (-1)
++#define OT_INVALID_LAYER       (-1)
++#define OT_INVALID_DEV         (-1)
++#define OT_INVALID_HANDLE      (-1)
++#define OT_INVALID_VALUE       (-1)
++#define OT_INVALID_TYPE        (-1)
++
++#define OT_MPP_MOD_VI             "vi"
++#define OT_MPP_MOD_VO             "vo"
++#define OT_MPP_MOD_VO_DEV         "vo_dev"
++#define OT_MPP_MOD_AVS            "avs"
++#define OT_MPP_MOD_HDMI           "hdmi"
++#define OT_MPP_MOD_VGS            "vgs"
++#define OT_MPP_MOD_GDC            "gdc"
++#define OT_MPP_MOD_DIS            "dis_gme"
++#define OT_MPP_MOD_GYRODIS        "dis_gyro"
++#define OT_MPP_MOD_CHNL           "chnl"
++#define OT_MPP_MOD_VENC           "venc"
++#define OT_MPP_MOD_VENC_MSG       "venc_msg"
++#define OT_MPP_MOD_VPSS           "vpss"
++#define OT_MPP_MOD_RGN            "rgn"
++#define OT_MPP_MOD_IVE            "ive"
++#define OT_MPP_MOD_FD             "fd"
++#define OT_MPP_MOD_MD             "md"
++#define OT_MPP_MOD_IVP            "ivp"
++#define OT_MPP_MOD_SVP            "svp"
++#define OT_MPP_MOD_SVP_NNIE       "nnie"
++#define OT_MPP_MOD_SVP_DSP        "dsp"
++#define OT_MPP_MOD_SVP_ALG        "svp_alg"
++#define OT_MPP_MOD_DPU_RECT       "rect"
++#define OT_MPP_MOD_DPU_MATCH      "match"
++#define OT_MPP_MOD_SVP_MAU        "mau"
++#define OT_MPP_MOD_H264E          "h264e"
++#define OT_MPP_MOD_H265E          "h265e"
++#define OT_MPP_MOD_SVAC3E         "svac3e"
++#define OT_MPP_MOD_JPEGE          "jpege"
++#define OT_MPP_MOD_MPEG4E         "mpeg4e"
++#define OT_MPP_MOD_VEDU           "vedu"
++#define OT_MPP_MOD_PRORES         "prores"
++#define OT_MPP_MOD_VDEC           "vdec"
++#define OT_MPP_MOD_H264D          "h264d"
++#define OT_MPP_MOD_JPEGD          "jpegd"
++#define OT_MPP_MOD_AI             "ai"
++#define OT_MPP_MOD_AO             "ao"
++#define OT_MPP_MOD_AENC           "aenc"
++#define OT_MPP_MOD_ADEC           "adec"
++#define OT_MPP_MOD_AIO            "aio"
++#define OT_MPP_MOD_ACODEC         "acodec"
++#define OT_MPP_MOD_AB             "ab"
++#define OT_MPP_MOD_VB             "vb"
++#define OT_MPP_MOD_VB_USER        "vb_user"
++#define OT_MPP_MOD_SYS            "sys"
++#define OT_MPP_MOD_SYS_USER       "sys_user"
++#define OT_MPP_MOD_CMPI           "cmpi"
++#define OT_MPP_MOD_PCIV           "pciv"
++#define OT_MPP_MOD_PCIVFMW        "pcivfmw"
++#define OT_MPP_MOD_PROC           "proc"
++#define OT_MPP_MOD_LOG            "logmpp"
++#define OT_MPP_MOD_LOG_USER       "logmpp_user"
++#define OT_MPP_MOD_LOG_MDC        "logmpp_mdc"
++#define OT_MPP_MOD_FB             "fb"
++#define OT_MPP_MOD_RC             "rc"
++#define OT_MPP_MOD_TDE            "tde"
++#define OT_MPP_MOD_ISP            "isp"
++#define OT_MPP_MOD_USR            "usr"
++#define OT_MPP_MOD_MCF            "mcf"
++#define OT_MPP_MOD_PM             "pm"
++#define OT_MPP_MOD_MFUSION        "motionfusion"
++#define OT_MPP_MOD_VDA            "vda"
++#define OT_MPP_MOD_VPP            "vpp"
++#define OT_MPP_MOD_KCF            "kcf"
++#define OT_MPP_MOD_PQP            "pqp"
++#define OT_MPP_MOD_SVP_NPU        "svp_npu"
++#define OT_MPP_MOD_NPU_DEV        "npudev"
++#define OT_MPP_MOD_NPU_AICPU      "aicpu"
++#define OT_MPP_MOD_NPU_DFX        "npudfx"
++#define OT_MPP_MOD_NPU_TSFW       "tsfw"
++#define OT_MPP_MOD_CIPHER         "cipher"
++#define OT_MPP_MOD_KLAD           "klad"
++#define OT_MPP_MOD_OTP            "otp"
++#define OT_MPP_MOD_DCC            "dcc"
++#define OT_MPP_MOD_VDEC_SERVERS   "vdec_server"
++#define OT_MPP_MOD_VDEC_ADAPT     "vdec_adapt"
++#define OT_MPP_MOD_VCA            "vca"
++#define OT_MPP_MOD_UVC            "uvc"
++#define OT_MPP_MOD_VI_RGBW        "vi_rgbw"
++#define OT_MPP_MOD_DEVSTAT        "devstat"
++
++typedef struct {
++    td_char version[OT_MAX_VERSION_NAME_LEN];
++} ot_mpp_version;
++
++typedef td_s32 ot_ai_chn;
++typedef td_s32 ot_ao_chn;
++typedef td_s32 ot_aenc_chn;
++typedef td_s32 ot_adec_chn;
++typedef td_s32 ot_audio_dev;
++typedef td_s32 ot_vi_dev;
++typedef td_s32 ot_vi_pipe;
++typedef td_s32 ot_vi_way;
++typedef td_s32 ot_vi_chn;
++typedef td_s32 ot_vi_grp;
++typedef td_s32 ot_vo_dev;
++typedef td_s32 ot_vo_layer;
++typedef td_s32 ot_vo_chn;
++typedef td_s32 ot_vo_wbc;
++typedef td_s32 ot_gfx_layer;
++typedef td_s32 ot_venc_chn;
++typedef td_s32 ot_vdec_chn;
++typedef td_s32 ot_ive_handle;
++typedef td_s32 ot_fd_chn;
++typedef td_s32 ot_md_chn;
++typedef td_s32 ot_isp_dev;
++typedef td_s32 ot_blk_dev;
++typedef td_s32 ot_sensor_id;
++typedef td_s32 ot_mipi_dev;
++typedef td_s32 ot_slave_dev;
++typedef td_s32 ot_svp_nnie_handle;
++typedef td_s32 ot_svp_dsp_handle;
++typedef td_s32 ot_svp_alg_chn;
++typedef td_s32 ot_svp_mau_handle;
++typedef td_s32 ot_vpss_grp;
++typedef td_s32 ot_vpss_grp_pipe;
++typedef td_s32 ot_vpss_chn;
++typedef td_s32 ot_avs_grp;
++typedef td_s32 ot_avs_pipe;
++typedef td_s32 ot_avs_chn;
++typedef td_s32 ot_mcf_grp;
++typedef td_s32 ot_mcf_pipe;
++typedef td_s32 ot_mcf_chn;
++typedef td_s32 ot_vda_chn;
++typedef td_s32 ot_pciv_chn;
++typedef td_s32 ot_uvc_chn;
++
++typedef enum {
++    OT_ID_MEM     = 0,
++    OT_ID_VB      = 1,
++    OT_ID_SYS     = 2,
++    OT_ID_RGN     = 3,
++    OT_ID_BASE    = 4,
++    OT_ID_VDEC    = 5,
++    OT_ID_AVS     = 6,
++    OT_ID_VPSS    = 7,
++    OT_ID_VENC    = 8,
++    OT_ID_SVP     = 9,
++    OT_ID_H264E   = 10,
++    OT_ID_JPEGE   = 11,
++    OT_ID_H265E   = 13,
++    OT_ID_JPEGD   = 14,
++    OT_ID_VO      = 15,
++    OT_ID_VI      = 16,
++    OT_ID_DIS     = 17,
++    OT_ID_CHNL    = 18,
++    OT_ID_RC      = 19,
++    OT_ID_AIO     = 20,
++    OT_ID_AI      = 21,
++    OT_ID_AO      = 22,
++    OT_ID_AENC    = 23,
++    OT_ID_ADEC    = 24,
++    OT_ID_VPU     = 25,
++    OT_ID_PCIV    = 26,
++    OT_ID_PCIVFMW = 27,
++    OT_ID_ISP     = 28,
++    OT_ID_IVE     = 29,
++    OT_ID_USER    = 30,
++    OT_ID_AIVSR   = 31,
++    OT_ID_PROC    = 33,
++    OT_ID_LOG     = 34,
++    OT_ID_VFMW    = 35,
++    OT_ID_GDC     = 37,
++    OT_ID_PHOTO   = 38,
++    OT_ID_FB      = 39,
++    OT_ID_HDMI    = 40,
++    OT_ID_VOIE    = 41,
++    OT_ID_TDE     = 42,
++    OT_ID_HDR     = 43,
++    OT_ID_PRORES  = 44,
++    OT_ID_VGS     = 45,
++    OT_ID_VCA     = 46,
++    OT_ID_FD      = 47,
++    OT_ID_OD      = 48,
++    OT_ID_LPR     = 50,
++    OT_ID_SVP_NNIE     = 51,
++    OT_ID_SVP_DSP      = 52,
++    OT_ID_DPU_RECT     = 53,
++    OT_ID_DPU_MATCH    = 54,
++
++    OT_ID_MOTIONSENSOR = 55,
++    OT_ID_MOTIONFUSION = 56,
++
++    OT_ID_GYRODIS      = 57,
++    OT_ID_PM           = 58,
++    OT_ID_SVP_ALG      = 59,
++    OT_ID_IVP          = 60,
++    OT_ID_MCF          = 61,
++    OT_ID_SVP_MAU      = 62,
++    OT_ID_VDA          = 63,
++    OT_ID_VPP          = 64,
++    OT_ID_KCF          = 65,
++    OT_ID_PQP          = 66,
++
++    OT_ID_NPUDEV       = 67,
++    OT_ID_AICPU        = 68,
++    OT_ID_NPUDFX       = 69,
++    OT_ID_TSFW         = 70,
++
++    OT_ID_CIPHER       = 71,
++    OT_ID_KLAD         = 72,
++    OT_ID_KEYSLOT      = 73,
++    OT_ID_OTP          = 74,
++    OT_ID_VDEC_ADAPT   = 75,
++    OT_ID_BLA          = 76,
++    OT_ID_VDEC_SERVER  = 77,
++    OT_ID_VFMW_MDC     = 78,
++    OT_ID_VB_LOG       = 79,
++    OT_ID_MCF_CALIBRATION = 80,
++    OT_ID_SVP_NPU      = 81,
++    OT_ID_HNR          = 82,
++    OT_ID_SNAP         = 83,
++    OT_ID_LOG_MDC      = 84,
++    OT_ID_VENC_SVR     = 85,
++    OT_ID_AB           = 86,
++    OT_ID_VO_DEV       = 87,
++    OT_ID_IRQ          = 88,
++    OT_ID_AIISP        = 89,
++    OT_ID_UVC          = 90,
++    OT_ID_VI_RGBW      = 91,
++    OT_ID_ACODEC       = 92,
++    OT_ID_SVAC3E       = 93,
++    OT_ID_MIPIRX       = 94,
++    OT_ID_AIDETECT     = 95,
++    OT_ID_DEVSTAT      = 96,
++    OT_ID_PSFM         = 97,
++    OT_ID_BUTT,
++} ot_mod_id;
++
++typedef struct {
++    ot_mod_id    mod_id;
++    td_s32      dev_id;
++    td_s32      chn_id;
++} ot_mpp_chn;
++
++/* We just copy this value of payload type from RTP/RTSP definition */
++typedef enum {
++    OT_PT_PCMU          = 0,
++    OT_PT_1016          = 1,
++    OT_PT_G721          = 2,
++    OT_PT_GSM           = 3,
++    OT_PT_G723          = 4,
++    OT_PT_DVI4_8K       = 5,
++    OT_PT_DVI4_16K      = 6,
++    OT_PT_LPC           = 7,
++    OT_PT_PCMA          = 8,
++    OT_PT_G722          = 9,
++    OT_PT_S16BE_STEREO  = 10,
++    OT_PT_S16BE_MONO    = 11,
++    OT_PT_QCELP         = 12,
++    OT_PT_CN            = 13,
++    OT_PT_MPEGAUDIO     = 14,
++    OT_PT_G728          = 15,
++    OT_PT_DVI4_3        = 16,
++    OT_PT_DVI4_4        = 17,
++    OT_PT_G729          = 18,
++    OT_PT_G711A         = 19,
++    OT_PT_G711U         = 20,
++    OT_PT_G726          = 21,
++    OT_PT_G729A         = 22,
++    OT_PT_LPCM          = 23,
++    OT_PT_CelB          = 25,
++    OT_PT_JPEG          = 26,
++    OT_PT_CUSM          = 27,
++    OT_PT_NV            = 28,
++    OT_PT_PICW          = 29,
++    OT_PT_CPV           = 30,
++    OT_PT_H261          = 31,
++    OT_PT_MPEGVIDEO     = 32,
++    OT_PT_MPEG2TS       = 33,
++    OT_PT_H263          = 34,
++    OT_PT_SPEG          = 35,
++    OT_PT_MPEG2VIDEO    = 36,
++    OT_PT_AAC           = 37,
++    OT_PT_WMA9STD       = 38,
++    OT_PT_HEAAC         = 39,
++    OT_PT_PCM_VOICE     = 40,
++    OT_PT_PCM_AUDIO     = 41,
++    OT_PT_MP3           = 43,
++    OT_PT_ADPCMA        = 49,
++    OT_PT_AEC           = 50,
++    OT_PT_X_LD          = 95,
++    OT_PT_H264          = 96,
++    OT_PT_D_GSM_HR      = 200,
++    OT_PT_D_GSM_EFR     = 201,
++    OT_PT_D_L8          = 202,
++    OT_PT_D_RED         = 203,
++    OT_PT_D_VDVI        = 204,
++    OT_PT_D_BT656       = 220,
++    OT_PT_D_H263_1998   = 221,
++    OT_PT_D_MP1S        = 222,
++    OT_PT_D_MP2P        = 223,
++    OT_PT_D_BMPEG       = 224,
++    OT_PT_MP4VIDEO      = 230,
++    OT_PT_MP4AUDIO      = 237,
++    OT_PT_VC1           = 238,
++    OT_PT_JVC_ASF       = 255,
++    OT_PT_D_AVI         = 256,
++    OT_PT_DIVX3         = 257,
++    OT_PT_AVS           = 258,
++    OT_PT_REAL8         = 259,
++    OT_PT_REAL9         = 260,
++    OT_PT_VP6           = 261,
++    OT_PT_VP6F          = 262,
++    OT_PT_VP6A          = 263,
++    OT_PT_SORENSON      = 264,
++    OT_PT_H265          = 265,
++    OT_PT_VP8           = 266,
++    OT_PT_MVC           = 267,
++    OT_PT_PNG           = 268,
++    /* add by vendor */
++    OT_PT_AMR           = 1001,
++    OT_PT_MJPEG         = 1002,
++    OT_PT_AMRWB         = 1003,
++    OT_PT_PRORES        = 1006,
++    OT_PT_OPUS          = 1007,
++    OT_PT_SVAC3         = 1008,
++    OT_PT_BUTT
++} ot_payload_type;
++
++#ifdef __cplusplus
++#if __cplusplus
++}
++#endif
++#endif /* end of #ifdef __cplusplus */
++
++#endif /* OT_COMMON_H */
+diff --git a/sdk/hi3516cv6xx/include/ot_common_region.h b/sdk/hi3516cv6xx/include/ot_common_region.h
+new file mode 100644
+index 0000000..8928140
+--- /dev/null
++++ b/sdk/hi3516cv6xx/include/ot_common_region.h
+@@ -0,0 +1,221 @@
++/*
++  Copyright (c), 2001-2025, Shenshu Tech. Co., Ltd.
++ */
++
++#ifndef OT_COMMON_REGION_H
++#define OT_COMMON_REGION_H
++
++#include "ot_common.h"
++#include "ot_common_video.h"
++#include "ot_errno.h"
++#include "ot_defines.h"
++
++#define OT_RGN_MAX_BMP_UPDATE_NUM      16
++#define OT_RGN_BATCH_HANDLE_MAX        24
++#define OT_RGN_QUAD_POINT_NUM          4
++#define OT_RGN_LINE_POINT_NUM          2
++#define OT_RGN_CLUT_NUM                16
++typedef td_u32 ot_rgn_handle;
++typedef td_u32 ot_rgn_handle_grp;
++
++/* type of video regions */
++typedef enum {
++    OT_RGN_OVERLAY = 0,
++    OT_RGN_COVER,
++    OT_RGN_OVERLAYEX,
++    OT_RGN_COVEREX,
++    OT_RGN_LINEEX,
++    OT_RGN_MOSAIC,
++    OT_RGN_MOSAICEX,
++    OT_RGN_CORNER_RECT,
++    OT_RGN_CORNER_RECTEX,
++    OT_RGN_BUTT
++} ot_rgn_type;
++
++typedef enum  {
++    OT_RGN_ATTACH_JPEG_MAIN = 0,
++    OT_RGN_ATTACH_JPEG_MPF0,
++    OT_RGN_ATTACH_JPEG_MPF1,
++    OT_RGN_ATTACH_JPEG_BUTT
++} ot_rgn_attach_dst;
++
++typedef struct {
++    td_bool        enable;
++    td_bool        is_abs_qp;
++    td_s32         qp_val;
++} ot_rgn_overlay_qp_info;
++
++typedef struct {
++    ot_pixel_format        pixel_format;    /* bitmap pixel format now support clut2 and clut4 */
++    td_u32                 bg_color;    /* background color, pixel format depends on "pixel_format" */
++    /*
++     * region size, width:[2, OT_RGN_OVERLAY_MAX_WIDTH], align:2,
++     * height:[2, OT_RGN_OVERLAY_MAX_HEIGHT], align:2
++     */
++    ot_size                size;
++    td_u32                 canvas_num;
++    td_u32                 clut[OT_RGN_CLUT_NUM];      /* color look up table */
++} ot_rgn_overlay_attr;
++
++typedef struct {
++    /*
++     * x:[0, OT_RGN_OVERLAY_MAX_X], align:2,
++     * y:[0, OT_RGN_OVERLAY_MAX_Y], align:2
++     */
++    ot_point                       point;
++    td_u32                         fg_alpha;
++    td_u32                         bg_alpha;
++    td_u32                         layer;     /* OVERLAY region layer range depends on OVERLAY max num */
++    ot_rgn_overlay_qp_info         qp_info;
++    ot_rgn_attach_dst              dst;
++} ot_rgn_overlay_chn_attr;
++
++typedef struct {
++    ot_pixel_format                pixel_format;
++    td_u32                         bg_color;    /* background color, pixel format depends on "pixel_format" */
++    /*
++     * region size, width:[2, OT_RGN_OVERLAY_MAX_WIDTH], align:2,
++     * height:[2, OT_RGN_OVERLAY_MAX_HEIGHT], align:2
++     */
++    ot_size                        size;
++    td_u32                         canvas_num;
++    td_u32                         clut[OT_RGN_CLUT_NUM];
++} ot_rgn_overlayex_attr;
++
++typedef struct {
++    /*
++     * x:[0, OT_RGN_OVERLAYEX_MAX_X], align:2,
++     * y:[0, OT_RGN_OVERLAYEX_MAX_Y], align:2
++     */
++    ot_point                       point;
++    td_u32                         fg_alpha;
++    td_u32                         bg_alpha;
++    td_u32                         layer;     /* OVERLAYEX region layer range depends on OVERLAYEX max num */
++} ot_rgn_overlayex_chn_attr;
++
++typedef struct {
++    ot_cover                       cover;
++    td_u32                         layer;  /* COVER region layer range depends on COVER max num */
++    ot_coord                       coord;  /* ratio coordinate or abs coordinate */
++} ot_rgn_cover_chn_attr;
++
++typedef struct {
++    ot_cover                       coverex;
++    td_u32                         layer;  /* COVEREX region layer range depends on COVEREX max num */
++    ot_coord                       coord;  /* ratio coordinate or abs coordinate */
++} ot_rgn_coverex_chn_attr;
++
++typedef struct {
++    ot_rect                        rect;              /* location of MOSAIC */
++    ot_mosaic_blk_size             blk_size;          /* block size of MOSAIC */
++    td_u32                         layer;             /* MOSAIC region layer range depends on MOSAIC max num */
++} ot_rgn_mosaic_chn_attr;
++
++typedef struct {
++    ot_rect                        rect;              /* location of MOSAICEX */
++    ot_mosaic_blk_size             blk_size;          /* block size of MOSAIC EX */
++    td_u32                         layer;             /* MOSAICEX region layer range depends on MOSAICEX max num */
++} ot_rgn_mosaicex_chn_attr;
++
++typedef union {
++    ot_rgn_overlay_attr           overlay; /* attribute of overlay region. AUTO:ot_rgn_type:OT_RGN_OVERLAY; */
++    ot_rgn_overlayex_attr         overlayex; /* attribute of overlayex region. AUTO:ot_rgn_type:OT_RGN_OVERLAYEX; */
++} ot_rgn_type_attr;
++
++typedef struct {
++    /* width of line range[OT_RGN_LINEEX_MIN_THICK, OT_RGN_LINEEX_MAX_THICK] */
++    td_u32                         thick;
++    td_u32                         color;                           /* color of line range [0, 0xffffff] */
++    ot_point                       points[OT_RGN_LINE_POINT_NUM];   /* startpoint and endpoint of line */
++} ot_rgn_lineex_chn_attr;
++
++typedef struct {
++    ot_corner_rect                 corner_rect;      /* location and size of corner rect */
++    ot_corner_rect_attr            corner_rect_attr; /* attribute of corner rect region */
++    td_u32                         layer;            /* CORNER_RECT region layer range depends on CORNER_RECT max num */
++} ot_rgn_corner_rectex_chn_attr;
++
++typedef struct {
++    ot_corner_rect                 corner_rect;      /* location and size of corner rect */
++    ot_corner_rect_attr            corner_rect_attr; /* attribute of corner rect region */
++    td_u32                         layer;            /* CORNER_RECT region layer range depends on CORNER_RECT max num */
++} ot_rgn_corner_rect_chn_attr;
++
++typedef union {
++    ot_rgn_overlay_chn_attr     overlay_chn; /* attribute of overlay region. AUTO:ot_rgn_type:OT_RGN_OVERLAY; */
++    ot_rgn_cover_chn_attr       cover_chn; /* attribute of cover region. AUTO:ot_rgn_type: OT_RGN_COVER; */
++    ot_rgn_overlayex_chn_attr   overlayex_chn; /* attribute of overlayex region. AUTO:ot_rgn_type: OT_RGN_OVERLAYEX; */
++    ot_rgn_coverex_chn_attr     coverex_chn; /* attribute of coverex region. AUTO:ot_rgn_type:OT_RGN_COVEREX; */
++    ot_rgn_lineex_chn_attr      lineex_chn; /* attribute of lineex region. AUTO:ot_rgn_type:OT_RGN_LINEEX; */
++    ot_rgn_mosaic_chn_attr      mosaic_chn; /* attribute of mosaic region. AUTO:ot_rgn_type:OT_RGN_MOSAIC; */
++    ot_rgn_mosaicex_chn_attr    mosaicex_chn; /* attribute of mosaicex region. AUTO:ot_rgn_type:OT_RGN_MOSAICEX; */
++    /*
++     * attribute of corner rect region.
++     * AUTO:ot_rgn_type:OT_RGN_CORNER_RECT;
++     */
++    ot_rgn_corner_rect_chn_attr corner_rect_chn;
++    /*
++     * attribute of corner rectex region.
++     * AUTO:ot_rgn_type:OT_RGN_CORNER_RECTEX;
++     */
++    ot_rgn_corner_rectex_chn_attr corner_rectex_chn;
++} ot_rgn_type_chn_attr;
++
++/* attribute of a region */
++typedef struct {
++    ot_rgn_type                    type;
++    ot_rgn_type_attr               attr; /* region attribute */
++} ot_rgn_attr;
++
++/* attribute of a region */
++typedef struct {
++    td_bool                        is_show;
++    ot_rgn_type                    type;
++    ot_rgn_type_chn_attr           attr;        /* region attribute */
++} ot_rgn_chn_attr;
++
++typedef struct {
++    td_phys_addr_t                 phys_addr;
++    ot_size                        size;
++    td_u32                         stride;
++    ot_pixel_format                pixel_format;
++    td_void  ATTRIBUTE             *virt_addr;
++} ot_rgn_canvas_info;
++
++    /* invalid device ID */
++#define OT_ERR_RGN_INVALID_DEV_ID OT_DEFINE_ERR(OT_ID_RGN, OT_ERR_LEVEL_ERROR, OT_ERR_INVALID_DEV_ID)
++    /* invalid channel ID */
++#define OT_ERR_RGN_INVALID_CHN_ID OT_DEFINE_ERR(OT_ID_RGN, OT_ERR_LEVEL_ERROR, OT_ERR_INVALID_CHN_ID)
++    /* at least one parameter is illegal, e.g. an illegal enumeration value */
++#define OT_ERR_RGN_ILLEGAL_PARAM OT_DEFINE_ERR(OT_ID_RGN, OT_ERR_LEVEL_ERROR, OT_ERR_ILLEGAL_PARAM)
++    /* channel exists */
++#define OT_ERR_RGN_EXIST OT_DEFINE_ERR(OT_ID_RGN, OT_ERR_LEVEL_ERROR, OT_ERR_EXIST)
++    /* not exist */
++#define OT_ERR_RGN_UNEXIST OT_DEFINE_ERR(OT_ID_RGN, OT_ERR_LEVEL_ERROR, OT_ERR_UNEXIST)
++    /* using a NULL pointer */
++#define OT_ERR_RGN_NULL_PTR OT_DEFINE_ERR(OT_ID_RGN, OT_ERR_LEVEL_ERROR, OT_ERR_NULL_PTR)
++    /* try to enable or initialize system, device or channel, before configuring attribute */
++#define OT_ERR_RGN_NOT_CFG OT_DEFINE_ERR(OT_ID_RGN, OT_ERR_LEVEL_ERROR, OT_ERR_NOT_CFG)
++    /* operation is not supported */
++#define OT_ERR_RGN_NOT_SUPPORT OT_DEFINE_ERR(OT_ID_RGN, OT_ERR_LEVEL_ERROR, OT_ERR_NOT_SUPPORT)
++    /* operation is not permitted, e.g. try to change static attribute */
++#define OT_ERR_RGN_NOT_PERM OT_DEFINE_ERR(OT_ID_RGN, OT_ERR_LEVEL_ERROR, OT_ERR_NOT_PERM)
++    /* failure caused by malloc memory */
++#define OT_ERR_RGN_NO_MEM OT_DEFINE_ERR(OT_ID_RGN, OT_ERR_LEVEL_ERROR, OT_ERR_NO_MEM)
++    /* failure caused by malloc buffer */
++#define OT_ERR_RGN_NO_BUF OT_DEFINE_ERR(OT_ID_RGN, OT_ERR_LEVEL_ERROR, OT_ERR_NO_BUF)
++    /* no data in buffer */
++#define OT_ERR_RGN_BUF_EMPTY OT_DEFINE_ERR(OT_ID_RGN, OT_ERR_LEVEL_ERROR, OT_ERR_BUF_EMPTY)
++    /* no buffer for new data */
++#define OT_ERR_RGN_BUF_FULL OT_DEFINE_ERR(OT_ID_RGN, OT_ERR_LEVEL_ERROR, OT_ERR_BUF_FULL)
++    /* bad address, e.g. used for copy_from_user & copy_to_user */
++#define OT_ERR_RGN_BAD_ADDR OT_DEFINE_ERR(OT_ID_RGN, OT_ERR_LEVEL_ERROR, OT_ERR_BAD_ADDR)
++    /* resource is busy, e.g. destroy a venc chn without unregistering it */
++#define OT_ERR_RGN_BUSY OT_DEFINE_ERR(OT_ID_RGN, OT_ERR_LEVEL_ERROR, OT_ERR_BUSY)
++    /*
++     * System is not ready, maybe not initialized or loaded.
++     * Returning the error code when opening a device file failed.
++     */
++#define OT_ERR_RGN_NOT_READY OT_DEFINE_ERR(OT_ID_RGN, OT_ERR_LEVEL_ERROR, OT_ERR_NOT_READY)
++
++#endif /* OT_COMMON_REGION_H */
+diff --git a/sdk/hi3516cv6xx/include/ot_common_video.h b/sdk/hi3516cv6xx/include/ot_common_video.h
+new file mode 100644
+index 0000000..810833f
+--- /dev/null
++++ b/sdk/hi3516cv6xx/include/ot_common_video.h
+@@ -0,0 +1,1528 @@
++/*
++  Copyright (c), 2001-2025, Shenshu Tech. Co., Ltd.
++ */
++
++#ifndef OT_COMMON_VIDEO_H
++#define OT_COMMON_VIDEO_H
++
++#include "ot_type.h"
++#include "ot_common.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif /* __cplusplus */
++
++#define OT_ISP_BAYER_CHN           4
++#define OT_DCF_DESCRIPTION_LENGTH  32
++#define OT_DCF_CAPTURE_TIME_LENGTH 20
++#define OT_CFACOLORPLANE           3
++#define OT_DNG_NP_SIZE             6
++#define OT_ISP_WB_GAIN_NUM         4
++/* 3*3=9 matrix */
++#define OT_ISP_CAP_CCM_NUM         9
++#define OT_SRC_LENS_COEF_NUM       9
++#define OT_DST_LENS_COEF_NUM       14
++#define OT_ISP_WDR_MAX_FRAME_NUM   4
++
++#define OT_GDC_COMMON_COEF_NUM     9
++#define OT_GDC_MAX_STITCH_NUM      4
++
++#define OT_NR_S_IDX_LEN            17
++
++#define OT_FMU_MIN_PAGE_NUM        4
++#define OT_FMU_MAX_Y_PAGE_NUM      512
++#define OT_FMU_MAX_C_PAGE_NUM      256
++
++#define OT_DIS_PRIVATE_NUM 9
++#define OT_DIS_MOTIONDATA_NUM 9
++#define OT_DIS_POINT_NUM 10
++#define OT_3DNR_LUT_LENGTH         17
++
++typedef enum  {
++    OT_OP_MODE_AUTO   = 0,
++    OT_OP_MODE_MANUAL = 1,
++    OT_OP_MODE_BUTT
++} ot_op_mode;
++
++typedef enum  {
++    OT_VB_SRC_COMMON  = 0,
++    OT_VB_SRC_MOD  = 1,
++    OT_VB_SRC_PRIVATE = 2,
++    OT_VB_SRC_USER    = 3,
++    OT_VB_SRC_BUTT
++} ot_vb_src;
++
++typedef enum  {
++    OT_ASPECT_RATIO_NONE   = 0,        /* full screen */
++    OT_ASPECT_RATIO_AUTO   = 1,        /* ratio no change, 1:1 */
++    OT_ASPECT_RATIO_MANUAL = 2,        /* ratio manual set */
++    OT_ASPECT_RATIO_BUTT
++} ot_aspect_ratio_type;
++
++typedef enum  {
++    OT_VIDEO_FIELD_TOP         = 1,    /* even field */
++    OT_VIDEO_FIELD_BOTTOM      = 2,    /* odd field */
++    OT_VIDEO_FIELD_INTERLACED  = 3,    /* two interlaced fields */
++    OT_VIDEO_FIELD_FRAME       = 4,    /* frame */
++
++    OT_VIDEO_FIELD_BUTT
++} ot_video_field;
++
++typedef enum  {
++    OT_VIDEO_FORMAT_LINEAR = 0,       /* nature video line */
++    OT_VIDEO_FORMAT_TILE_64x16,       /* tile cell: 64pixel x 16line */
++    OT_VIDEO_FORMAT_TILE_16x8,        /* tile cell: 16pixel x 8line */
++    OT_VIDEO_FORMAT_TILE_32x4,        /* tile cell: 32pixel x 4ine */
++
++    OT_VIDEO_FORMAT_BUTT
++} ot_video_format;
++
++typedef enum  {
++    OT_COMPRESS_MODE_NONE = 0,      /* no compress */
++    OT_COMPRESS_MODE_SEG,           /* compress unit is 256x1 bytes as a segment. */
++    OT_COMPRESS_MODE_SEG_COMPACT,   /* compact compress unit is 256x1 bytes as a segment. */
++    OT_COMPRESS_MODE_TILE,          /* compress unit is a tile. */
++    OT_COMPRESS_MODE_LINE,          /* compress unit is the whole line. */
++    OT_COMPRESS_MODE_FRAME,         /* compress unit is the whole frame. YUV for 3DNR */
++    OT_COMPRESS_MODE_FMAP,          /* compress unit is the whole line, based on mapping transformation. */
++
++    OT_COMPRESS_MODE_BUTT
++} ot_compress_mode;
++
++typedef enum  {
++    OT_VIDEO_DISPLAY_MODE_PREVIEW  = 0,
++    OT_VIDEO_DISPLAY_MODE_PLAYBACK = 1,
++
++    OT_VIDEO_DISPLAY_MODE_BUTT
++} ot_video_display_mode;
++
++typedef enum  {
++    OT_FRAME_FLAG_SNAP_FLASH        = 0x1 << 0,
++    OT_FRAME_FLAG_SNAP_CUR          = 0x1 << 1,
++    OT_FRAME_FLAG_SNAP_REF          = 0x1 << 2,
++    OT_FRAME_FLAG_SNAP_END          = 0x1 << 3,
++    OT_FRAME_FLAG_MIRROR            = 0x1 << 4,
++    OT_FRAME_FLAG_FLIP              = 0x1 << 5,
++    OT_FRAME_FLAG_DGAIN_BYPASS      = 0x1 << 6,
++    OT_FRAME_FLAG_OUTPUT_NONE       = 0x1 << 7,
++    OT_FRAME_FLAG_USER_SEND_DISCARD = 0x1 << 8,
++    OT_FRAME_FLAG_ROTATION_90       = 0x1 << 9,
++    OT_FRAME_FLAG_ROTATION_270      = 0x1 << 10,
++    OT_FRAME_FLAG_SVC_FLAG          = 0x1 << 11,
++    OT_FRAME_FLAG_BUTT
++} ot_frame_flag;
++
++typedef enum  {
++    OT_COLOR_GAMUT_BT601 = 0,
++    OT_COLOR_GAMUT_BT709,
++    OT_COLOR_GAMUT_BT2020,
++    OT_COLOR_GAMUT_USER,
++    OT_COLOR_GAMUT_BUTT
++} ot_color_gamut;
++
++/* we ONLY define picture format used, all unused will be deleted! */
++typedef enum {
++    OT_PIXEL_FORMAT_RGB_444 = 0,
++    OT_PIXEL_FORMAT_RGB_555,
++    OT_PIXEL_FORMAT_RGB_565,
++    OT_PIXEL_FORMAT_RGB_888,
++
++    OT_PIXEL_FORMAT_BGR_444,
++    OT_PIXEL_FORMAT_BGR_555,
++    OT_PIXEL_FORMAT_BGR_565,
++    OT_PIXEL_FORMAT_BGR_888,
++
++    OT_PIXEL_FORMAT_ARGB_1555,
++    OT_PIXEL_FORMAT_ARGB_4444,
++    OT_PIXEL_FORMAT_ARGB_8565,
++    OT_PIXEL_FORMAT_ARGB_8888,
++    OT_PIXEL_FORMAT_ARGB_2BPP,
++    OT_PIXEL_FORMAT_ARGB_CLUT2,
++    OT_PIXEL_FORMAT_ARGB_CLUT2_2X2,
++    OT_PIXEL_FORMAT_ARGB_CLUT2_4X4,
++    OT_PIXEL_FORMAT_ARGB_CLUT4,
++    OT_PIXEL_FORMAT_ARGB_CLUT4_2X2,
++    OT_PIXEL_FORMAT_ARGB_CLUT4_4X4,
++
++    OT_PIXEL_FORMAT_ABGR_1555,
++    OT_PIXEL_FORMAT_ABGR_4444,
++    OT_PIXEL_FORMAT_ABGR_8565,
++    OT_PIXEL_FORMAT_ABGR_8888,
++
++    OT_PIXEL_FORMAT_RGB_BAYER_8BPP,
++    OT_PIXEL_FORMAT_RGB_BAYER_10BPP,
++    OT_PIXEL_FORMAT_RGB_BAYER_12BPP,
++    OT_PIXEL_FORMAT_RGB_BAYER_14BPP,
++    OT_PIXEL_FORMAT_RGB_BAYER_16BPP,
++
++    OT_PIXEL_FORMAT_RGB_BAYER_16BPP_H10,
++    OT_PIXEL_FORMAT_RGB_BAYER_16BPP_H12,
++    OT_PIXEL_FORMAT_RGB_BAYER_16BPP_H14,
++
++    OT_PIXEL_FORMAT_RGB_BAYER_16BPP_L10,
++    OT_PIXEL_FORMAT_RGB_BAYER_16BPP_L12,
++    OT_PIXEL_FORMAT_RGB_BAYER_16BPP_L14,
++
++    OT_PIXEL_FORMAT_YVU_PLANAR_422,
++    OT_PIXEL_FORMAT_YVU_PLANAR_420,
++    OT_PIXEL_FORMAT_YVU_PLANAR_444,
++
++    OT_PIXEL_FORMAT_YVU_SEMIPLANAR_422,
++    OT_PIXEL_FORMAT_YVU_SEMIPLANAR_420,
++    OT_PIXEL_FORMAT_YVU_SEMIPLANAR_444,
++
++    OT_PIXEL_FORMAT_YUV_SEMIPLANAR_422,
++    OT_PIXEL_FORMAT_YUV_SEMIPLANAR_420,
++    OT_PIXEL_FORMAT_YUV_SEMIPLANAR_444,
++
++    OT_PIXEL_FORMAT_YUYV_PACKAGE_422,
++    OT_PIXEL_FORMAT_YVYU_PACKAGE_422,
++    OT_PIXEL_FORMAT_UYVY_PACKAGE_422,
++    OT_PIXEL_FORMAT_VYUY_PACKAGE_422,
++    OT_PIXEL_FORMAT_YYUV_PACKAGE_422,
++    OT_PIXEL_FORMAT_YYVU_PACKAGE_422,
++    OT_PIXEL_FORMAT_UVYY_PACKAGE_422,
++    OT_PIXEL_FORMAT_VUYY_PACKAGE_422,
++    OT_PIXEL_FORMAT_VY1UY0_PACKAGE_422,
++
++    OT_PIXEL_FORMAT_YUV_400,
++    OT_PIXEL_FORMAT_UV_420,
++
++    /* SVP data format */
++    OT_PIXEL_FORMAT_BGR_888_PLANAR,
++    OT_PIXEL_FORMAT_HSV_888_PACKAGE,
++    OT_PIXEL_FORMAT_HSV_888_PLANAR,
++    OT_PIXEL_FORMAT_LAB_888_PACKAGE,
++    OT_PIXEL_FORMAT_LAB_888_PLANAR,
++    OT_PIXEL_FORMAT_S8C1,
++    OT_PIXEL_FORMAT_S8C2_PACKAGE,
++    OT_PIXEL_FORMAT_S8C2_PLANAR,
++    OT_PIXEL_FORMAT_S8C3_PLANAR,
++    OT_PIXEL_FORMAT_S16C1,
++    OT_PIXEL_FORMAT_U8C1,
++    OT_PIXEL_FORMAT_U16C1,
++    OT_PIXEL_FORMAT_S32C1,
++    OT_PIXEL_FORMAT_U32C1,
++    OT_PIXEL_FORMAT_U64C1,
++    OT_PIXEL_FORMAT_S64C1,
++
++    /*
++     * AD data format for raw pipe
++     * When MIPI is connected, VI Pipe receives package yuv422 (actual data) in raw16 format
++     * When BT656 is connected, VI Pipe receives package yuv422 in raw8 format, the number of line
++     * direction pixels is doubled, eg: 3840*1080(raw8) indicate 1920*1080(package yuv422)
++     */
++    OT_PIXEL_FORMAT_RGB_BAYER_16BPP_INDICATE_YUYV_PACKAGE_422,
++    OT_PIXEL_FORMAT_RGB_BAYER_8BPP_INDICATE_UYVY_PACKAGE_422,
++    OT_PIXEL_FORMAT_BUTT
++} ot_pixel_format;
++
++typedef enum  {
++    OT_DYNAMIC_RANGE_SDR8 = 0,
++    OT_DYNAMIC_RANGE_SDR10,
++    OT_DYNAMIC_RANGE_HDR10,
++    OT_DYNAMIC_RANGE_HLG,
++    OT_DYNAMIC_RANGE_SLF,
++    OT_DYNAMIC_RANGE_XDR,
++    OT_DYNAMIC_RANGE_BUTT
++} ot_dynamic_range;
++
++typedef enum  {
++    OT_DATA_BIT_WIDTH_8 = 0,
++    OT_DATA_BIT_WIDTH_10,
++    OT_DATA_BIT_WIDTH_12,
++    OT_DATA_BIT_WIDTH_14,
++    OT_DATA_BIT_WIDTH_16,
++    OT_DATA_BIT_WIDTH_32,
++    OT_DATA_BIT_WIDTH_64,
++    OT_DATA_BIT_WIDTH_BUTT
++} ot_data_bit_width;
++
++typedef struct {
++    td_u32 top_width;
++    td_u32 bottom_width;
++    td_u32 left_width;
++    td_u32 right_width;
++    td_u32 color;
++} ot_border;
++
++typedef struct {
++    td_s32 x;
++    td_s32 y;
++} ot_point;
++
++typedef struct {
++    td_u32 width;
++    td_u32 height;
++} ot_size;
++
++typedef struct {
++    td_s32 x;
++    td_s32 y;
++    td_u32 width;
++    td_u32 height;
++} ot_rect;
++
++typedef enum {
++    OT_COORD_ABS = 0,                          /* Absolute coordinate. */
++    OT_COORD_RATIO,                            /* Ratio coordinate. */
++    OT_COORD_BUTT
++} ot_coord;
++
++typedef enum {
++    OT_COVER_RECT = 0,                         /* Rectangle cover. */
++    OT_COVER_QUAD,                             /* Quadrangle cover. */
++    OT_COVER_BUTT
++} ot_cover_type;
++
++typedef struct {
++    td_bool        is_solid;                   /* RW; Solid or hollow cover. */
++    td_u32         thick;                      /* RW; Thick of the hollow quadrangle. */
++    ot_point       point[OT_QUAD_POINT_NUM];   /* RW; Four points of the quadrangle. */
++} ot_quad_cover;
++
++typedef struct {
++    td_bool        is_solid;  /* RW; Solid or hollow cover. */
++    td_u32         thick;     /* RW; Thick of the hollow rectangle. */
++    ot_rect        rect;      /* RW; The area of rectangle. */
++} ot_rect_cover;
++
++typedef struct {
++    ot_cover_type      type;   /* RW; Cover type. */
++    union {
++        ot_rect_cover  rect_attr;   /* RW; The rectangle area. AUTO:ot_cover_type:OT_COVER_RECT; */
++        ot_quad_cover  quad_attr;   /* RW; The quadrangle area.  AUTO:ot_cover_type:OT_COVER_QUAD; */
++    };
++    td_u32             color;  /* RW; Range: [0,0xFFFFFF]; Color of cover. */
++} ot_cover;
++
++typedef enum  {
++    OT_MOSAIC_BLK_SIZE_4 = 0, /* block size 4 * 4 of MOSAIC */
++    OT_MOSAIC_BLK_SIZE_8,     /* block size 8 * 8 of MOSAIC */
++    OT_MOSAIC_BLK_SIZE_16,    /* block size 16 * 16 of MOSAIC */
++    OT_MOSAIC_BLK_SIZE_32,    /* block size 32 * 32 of MOSAIC */
++    OT_MOSAIC_BLK_SIZE_64,    /* block size 64 * 64 of MOSAIC */
++    OT_MOSAIC_BLK_SIZE_128,   /* block size 128 * 128 of MOSAIC */
++    OT_MOSAIC_BLK_SIZE_BUTT
++} ot_mosaic_blk_size;
++
++typedef struct {
++    ot_mosaic_blk_size blk_size;
++    ot_rect            rect;   /* RW; The rectangle area. */
++} ot_mosaic;
++
++typedef struct {
++    td_bool enable;
++    ot_rect  rect;
++} ot_crop_info;
++
++typedef struct {
++    td_s32  src_frame_rate;        /* RW; source frame rate */
++    td_s32  dst_frame_rate;        /* RW; dest frame rate */
++} ot_frame_rate_ctrl;
++
++typedef struct {
++    ot_aspect_ratio_type mode;          /* aspect ratio mode: none/auto/manual */
++    td_u32               bg_color;      /* background color, RGB 888 */
++    ot_rect              video_rect;    /* valid in ASPECT_RATIO_MANUAL mode */
++} ot_aspect_ratio;
++
++typedef struct {
++    td_s16              offset_top;           /* top offset of show area */
++    td_s16              offset_left;          /* left offset of show area */
++    td_s16              offset_bottom;        /* bottom offset of show area */
++    td_s16              offset_right;         /* right offset of show area */
++
++    td_u32              max_luma;             /* for HDR */
++    td_u32              min_luma;             /* for HDR */
++    td_u64              private_data[OT_MAX_PRIVATE_DATA_NUM];
++} ot_video_supplement_misc;
++
++typedef struct {
++    td_phys_addr_t   misc_info_phys_addr;        /* default allocated buffer */
++    td_phys_addr_t   jpeg_dcf_phys_addr;
++    td_phys_addr_t   isp_info_phys_addr;
++    td_phys_addr_t   low_delay_phys_addr;
++    td_phys_addr_t   bnr_mot_phys_addr;
++    td_phys_addr_t   motion_data_phys_addr;
++    td_phys_addr_t   frame_dng_phys_addr;
++    td_phys_addr_t   aiisp_phys_addr;
++
++    td_void* ATTRIBUTE misc_info_virt_addr;       /* misc info */
++    td_void* ATTRIBUTE jpeg_dcf_virt_addr;        /* jpeg_dcf, used in JPEG DCF */
++    td_void* ATTRIBUTE isp_info_virt_addr;        /* isp_frame_info, used in ISP debug, when get raw and send raw */
++    td_void* ATTRIBUTE low_delay_virt_addr;       /* used in low delay */
++    td_void* ATTRIBUTE bnr_mot_virt_addr;         /* used for 3dnr from bnr mot */
++    td_void* ATTRIBUTE motion_data_virt_addr;     /* gme motion data, filter motion data, gyro data. */
++    td_void* ATTRIBUTE frame_dng_virt_addr;
++    td_void* ATTRIBUTE aiisp_virt_addr;           /* aiisp info */
++} ot_video_supplement;
++
++typedef struct {
++    td_u32              width;
++    td_u32              height;
++    ot_video_field      field;
++    ot_pixel_format     pixel_format;
++    ot_video_format     video_format;
++    ot_compress_mode    compress_mode;
++    ot_dynamic_range    dynamic_range;
++    ot_color_gamut      color_gamut;
++
++    td_u32              header_stride[OT_MAX_COLOR_COMPONENT];
++    td_u32              stride[OT_MAX_COLOR_COMPONENT];
++
++    td_phys_addr_t      header_phys_addr[OT_MAX_COLOR_COMPONENT];
++    td_phys_addr_t      phys_addr[OT_MAX_COLOR_COMPONENT];
++    td_void* ATTRIBUTE  header_virt_addr[OT_MAX_COLOR_COMPONENT];
++    td_void* ATTRIBUTE  virt_addr[OT_MAX_COLOR_COMPONENT];
++
++    td_u32              time_ref;
++    td_u64              pts;
++
++    td_u64              user_data[OT_MAX_USER_DATA_NUM];
++    td_u32              frame_flag;     /* frame_flag, can be OR operation. */
++    ot_video_supplement supplement;
++} ot_video_frame;
++
++typedef struct {
++    ot_video_frame video_frame;
++    td_u32        pool_id;
++    ot_mod_id      mod_id;
++} ot_video_frame_info;
++
++typedef struct {
++    td_u32 vb_size;
++
++    td_u32 head_stride;
++    td_u32 head_size;
++    td_u32 head_y_size;
++
++    td_u32 main_stride;
++    td_u32 main_size;
++    td_u32 main_y_size;
++} ot_vb_calc_cfg;
++
++typedef struct {
++    ot_pixel_format pixel_format;  /* bitmap's pixel format */
++    td_u32 width;               /* bitmap's width */
++    td_u32 height;              /* bitmap's height */
++    td_void* ATTRIBUTE data;      /* address of bitmap's data */
++} ot_bmp;
++
++/* Angle of rotation */
++typedef enum  {
++    OT_ROTATION_0   = 0,
++    OT_ROTATION_90  = 1,
++    OT_ROTATION_180 = 2,
++    OT_ROTATION_270 = 3,
++    OT_ROTATION_BUTT
++} ot_rotation;
++
++typedef enum {
++    OT_ROTATION_VIEW_TYPE_ALL      = 0, /* View all source Image,no lose */
++    OT_ROTATION_VIEW_TYPE_TYPICAL  = 1, /* View from rotation Image with source size,same lose */
++    OT_ROTATION_VIEW_TYPE_INSIDE   = 2, /* View with no black section,all  in dest Image */
++    OT_ROTATION_VIEW_TYPE_BUTT,
++} ot_rotation_view_type;
++
++typedef struct {
++    ot_rotation_view_type view_type; /* RW;range: [0, 2];rotation mode */
++    td_u32    angle; /* RW;range: [0,360];rotation angle:[0,360] */
++    /* RW;range: [-511, 511];horizontal offset of the image distortion center relative to image center. */
++    td_s32    center_x_offset;
++    /* RW;range: [-511, 511];vertical offset of the image distortion center relative to image center. */
++    td_s32    center_y_offset;
++    ot_size   dst_size; /* RW; range: width:[480, 8192],height:[360, 8192]; dest size of any angle rotation */
++} ot_free_rotation_attr;
++
++typedef enum {
++    OT_ROTATION_ANG_FIXED = 0,  /* Fixed angle. */
++    OT_ROTATION_ANG_FREE,       /* Free angle. */
++    OT_ROTATION_ANG_FREE_HP,    /* Free high-precision angle. */
++    OT_ROTATION_ANG_BUTT
++} ot_rotation_type;
++
++typedef struct {
++    td_bool             enable;         /* RW; range: [0, 1]; Rotate enable. */
++    ot_rotation_type    rotation_type;  /* RW; Rotate type. */
++    union {
++        /*
++         * RW; Fixed rotation attribute.
++         * AUTO:ot_rotation_type:OT_ROTATION_ANG_FIXED;
++         */
++        ot_rotation rotation_fixed;
++        /*
++         * RW; Free rotation attribute.
++         * AUTO:ot_rotation_type:OT_ROTATION_ANG_FREE, OT_ROTATION_ANG_FREE_HP;
++         */
++        ot_free_rotation_attr rotation_free; /* Not supported for Hi3516CV610 */
++    };
++} ot_rotation_attr;
++
++typedef enum  {
++    OT_FRAME_INTERRUPT_START,
++    OT_FRAME_INTERRUPT_EARLY,
++    OT_FRAME_INTERRUPT_EARLY_END,
++    OT_FRAME_INTERRUPT_EARLY_EARLY,
++    OT_FRAME_INTERRUPT_BUTT,
++} ot_frame_interrupt_type;
++
++typedef struct {
++    ot_frame_interrupt_type interrupt_type;
++    td_u32 early_line;
++} ot_frame_interrupt_attr;
++
++typedef enum {
++    OT_DATA_RATE_X1 = 0, /* RW; output 1 pixel per clock */
++    OT_DATA_RATE_X2,     /* RW; output 2 pixel per clock */
++
++    OT_DATA_RATE_BUTT
++} ot_data_rate;
++
++typedef enum {
++    OT_WDR_MODE_NONE = 0,
++    OT_WDR_MODE_BUILT_IN,
++    OT_WDR_MODE_QUADRA,
++
++    OT_WDR_MODE_2To1_LINE,
++    OT_WDR_MODE_2To1_FRAME,
++
++    OT_WDR_MODE_3To1_LINE,
++    OT_WDR_MODE_3To1_FRAME,
++
++    OT_WDR_MODE_4To1_LINE,
++    OT_WDR_MODE_4To1_FRAME,
++
++    OT_WDR_MODE_BUTT,
++} ot_wdr_mode;
++
++typedef enum {
++    OT_CORNER_RECT_TYPE_CORNER = 0,
++    OT_CORNER_RECT_TYPE_FULL_LINE,
++    OT_CORNER_RECT_TYPE_BUTT
++}ot_corner_rect_type;
++
++typedef struct {
++    ot_rect      rect;
++    td_u32       hor_len;
++    td_u32       ver_len;
++    td_u32       thick;
++} ot_corner_rect;
++
++typedef struct {
++    ot_corner_rect_type    corner_rect_type;
++    td_u32                 color;
++} ot_corner_rect_attr;
++
++typedef struct {
++    td_u8 image_description[OT_DCF_DESCRIPTION_LENGTH];
++    /* shows manufacturer of digital cameras */
++    td_u8 make[OT_DCF_DESCRIPTION_LENGTH];
++    /* shows model number of digital cameras */
++    td_u8 model[OT_DCF_DESCRIPTION_LENGTH];
++    /* shows firmware (internal software of digital cameras) version number */
++    td_u8 software[OT_DCF_DESCRIPTION_LENGTH];
++    /*
++     * light source, actually this means white balance setting. '0' means unknown, '1' daylight,
++     * '2' fluorescent, '3' tungsten, '10' flash, '17' standard light A, '18' standard light B,
++     * '19' standard light C, '20' D55, '21' D65, '22' D75, '255' other.
++     */
++    td_u8 light_source;
++    /* focal length of lens used to take image. unit is millimeter */
++    td_u32 focal_length;
++    /* indicates the type of scene. value '0x01' means that the image was directly photographed. */
++    td_u8 scene_type;
++    /*
++     * indicates the use of special processing on image data, such as rendering geared to output.
++     * 0 = normal process, 1 = custom process.
++     */
++    td_u8 custom_rendered;
++    /* indicates the equivalent focal length assuming a 35mm film camera, in mm */
++    td_u8 focal_length_in35mm_film;
++    /* indicates the type of scene that was shot. 0 = standard, 1 = landscape, 2 = portrait, 3 = night scene. */
++    td_u8 scene_capture_type;
++    /*
++     * indicates the degree of overall image gain adjustment. 0 = none, 1 = low gain up, 2 = high gain up,
++     * 3 = low gain down, 4 = high gain down.
++     */
++    td_u8 gain_control;
++    /*
++     * indicates the direction of contrast processing applied by the camera when the image was shot.
++     * 0 = normal, 1 = soft, 2 = hard.
++     */
++    td_u8 contrast;
++    /*
++     * indicates the direction of saturation processing applied by the camera when the image was shot.
++     * 0 = normal, 1 = low saturation, 2 = high saturation.
++     */
++    td_u8 saturation;
++    /*
++     * indicates the direction of sharpness processing applied by the camera when the image was shot.
++     * 0 = normal, 1 = soft, 2 = hard.
++     */
++    td_u8 sharpness;
++    /*
++     * exposure metering method. '0' means unknown, '1' average, '2' center weighted average, '3' spot,
++     * '4' multi-spot, '5' multi-segment, '6' partial, '255' other.
++     */
++    td_u8 metering_mode;
++} ot_isp_dcf_const_info;
++
++typedef struct {
++    /* CCD sensitivity equivalent to ag-hr film speedrate */
++    td_u32 iso_speed_ratings;
++    /* exposure time (reciprocal of shutter speed). */
++    td_u32 exposure_time;
++    /* exposure bias (compensation) value of taking picture */
++    td_u32 exposure_bias_value;
++    /*
++     * exposure program that the camera used when image was taken. '1' means manual control,
++     * '2' program normal, '3' aperture priority, '4' shutter priority, '5' program creative (slow program),
++     * '6' program action(high-speed program), '7' portrait mode, '8' landscape mode.
++     */
++    td_u8 exposure_program;
++    /* the actual F-number (F-stop) of lens when the image was taken */
++    td_u32 f_number;
++    /* maximum aperture value of lens. */
++    td_u32 max_aperture_value;
++    /*
++     * indicates the exposure mode set when the image was shot.
++     * 0 = auto exposure, 1 = manual exposure, 2 = auto bracket
++     */
++    td_u8 exposure_mode;
++    /*
++     * indicates the white balance mode set when the image was shot.
++     * 0 = auto white balance, 1 = manual white balance.
++     */
++    td_u8 white_balance;
++} ot_isp_dcf_update_info;
++
++typedef struct {
++    ot_isp_dcf_const_info  isp_dcf_const_info;
++    ot_isp_dcf_update_info isp_dcf_update_info;
++} ot_isp_dcf_info;
++
++typedef struct {
++    /* the date and time when the picture data was generated */
++    td_u8           capture_time[OT_DCF_CAPTURE_TIME_LENGTH];
++    /* whether the picture is captured when a flash lamp is on */
++    td_bool         flash;
++    /*
++     * indicates the digital zoom ratio when the image was shot.
++     * if the numerator of the recorded value is 0, this indicates that digital zoom was not used.
++     */
++    td_u32          digital_zoom_ratio;
++    ot_isp_dcf_info isp_dcf_info;
++} ot_jpeg_dcf;
++
++/*
++ * Defines the ISP FSWDR operating mode
++ * 0 = Normal FSWDR mode
++ * 1 = Long frame mode, only effective in LINE_WDR,
++ * when running in this mode FSWDR module only output the long frame data
++ */
++typedef enum {
++    OT_ISP_FSWDR_NORMAL_MODE          = 0x0,
++    OT_ISP_FSWDR_LONG_FRAME_MODE      = 0x1,
++    OT_ISP_FSWDR_AUTO_LONG_FRAME_MODE = 0x2, /* Auto long frame mode, only effective in LINE_WDR,  When running in this
++                                             mode, normal WDR and long frame mode would auto switch */
++    OT_ISP_FSWDR_MODE_BUTT
++} ot_isp_fswdr_mode;
++
++typedef struct {
++    td_u32      iso;                    /* ISP internal ISO : again*dgain*is_pgain */
++    td_u32      exposure_time[OT_ISP_WDR_MAX_FRAME_NUM]; /* exposure time (reciprocal of shutter speed), unit is us */
++    td_u32      isp_dgain[OT_ISP_WDR_MAX_FRAME_NUM];
++    td_u32      again[OT_ISP_WDR_MAX_FRAME_NUM];
++    td_u32      dgain[OT_ISP_WDR_MAX_FRAME_NUM];
++    ot_isp_fswdr_mode fs_wdr_mode;
++
++    td_s32      fe_id[OT_ISP_WDR_MAX_FRAME_NUM];
++    td_u32      ratio[OT_ISP_WDR_MAX_FRAME_NUM - 1];
++    td_u32      isp_nr_strength;
++    td_u32      f_number;               /* the actual F-number (F-stop) of lens when the image was taken */
++    td_u32      sensor_id;              /* which sensor is used */
++    td_u32      sensor_mode;
++    td_u32      hmax_times;             /* sensor hmax_times,unit is ns */
++    td_u32      vmax;                   /* sensor vmax,unit is line */
++    td_u32      vc_num;                 /* when dump wdr frame, which is long or short  exposure frame. */
++    td_u32      wb_gain[OT_ISP_WB_GAIN_NUM]; /* white balance gain info */
++    td_u16      ccm[OT_ISP_CAP_CCM_NUM];     /* RW; Range: [0x0, 0xFFFF]; Format:8.8; Manual CCM matrix. */
++    td_u32      exposure_distance[OT_ISP_WDR_MAX_FRAME_NUM - 1]; /* wdr sensor exposure distance line number. */
++    td_s32      sync_id;
++    td_u32      blc_sync_id;
++    td_bool     dgain_agamma_en;
++} ot_isp_frame_info;
++
++typedef struct {
++    td_u32 color_temp;
++    td_u16 ccm[OT_ISP_CAP_CCM_NUM];
++    td_u8  saturation;
++} ot_isp_hdr_info;
++
++typedef enum {
++    OT_NR_V1 = 1,
++    OT_NR_V2 = 2,
++
++    OT_NR_BUTT
++} ot_nr_version;
++
++typedef struct {
++    /* ies0~3 for different frequency response. */
++    td_u16 ies0;     /* RW; Range: [0, 255]; The gains of edge and texture enhancement. */
++    td_u16 ies1;     /* RW; Range: [0, 255]; The gains of edge and texture enhancement. */
++    td_u16 ies2;     /* RW; Range: [0, 255]; The gains of edge and texture enhancement. */
++    td_u16 ies3;     /* RW; Range: [0, 255]; The gains of edge and texture enhancement. */
++    td_u16 aux_ies;  /* RW; Range: [0, 255]; The gains of edge enhancement for NO.2 filter. */
++    struct {
++        td_u16 iedz : 10;    /* RW; Range: [0, 999]; The threshold to control the generated artifacts. */
++        td_u16 _rb_ : 6;
++    };
++    td_u8 o_sht;       /* RW; Range: [0, 255]; The gains to control the overshoot. */
++    td_u8 u_sht;       /* RW; Range: [0, 255]; The gains to control the undershoot. */
++    td_u8 aux_o_sht;   /* RW; Range: [0, 255]; The gains to control the overshoot. */
++    td_u8 aux_u_sht;   /* RW; Range: [0, 255]; The gains to control the undershoot. */
++} ot_nr_v1_adv_iey;
++
++typedef struct {
++    struct {
++        td_u16 spn6    : 4;  /* RW; Range: [0,   5]; The selection of filters to be mixed for NO.6 filter. */
++        td_u16 sbn6    : 4;  /* RW; Range: [0,   5]; The selection of filters to be mixed for NO.6 filter. */
++        td_u16 pbr6    : 5;  /* RW; Range: [0,  16]; The mix ratio between spn and sbr. */
++        td_u16 j_mode6 : 2;  /* RW; Range: [0,   2]; The selection modes for the blending of spatial filters. */
++        td_u16 _rb_   : 1;  /* RW; Reserved */
++    };
++    td_u8 sfr6[4];     /* RW; Range: [0, 31]; The relative NR strength for NO.6 filter. (Effective when jmode = 2). */
++    td_u8 sbr6[2];     /* RW; Range: [0, 15]; The control of overshoot and undershoot. */
++    td_u8 sfs1;        /* RW; Range: [0, 255]; The NR strength parameters for NO.1 filter. */
++    td_u8 sfs2;        /* RW; Range: [0, 255]; Currently no use, reserved. */
++    td_u16 bld1;       /* RW; Range: [0, 999];  The NR strength parameters for NO.1 filter. */
++    struct {
++        td_u16 spn3  : 3;  /* RW; Range: [0,   5]; The selection of filters to be mixed for NO.3 filter. */
++        td_u16 sbn3  : 3;  /* RW; Range: [0,   5]; The selection of filters to be mixed for NO.3 filter. */
++        td_u16 pbr3  : 5;  /* RW; Range: [0,  16]; The mix ratio between spn and sbr. */
++        td_u16 _rb0_ : 5;
++    };
++    struct {
++        td_u16 spn4  : 3;  /* RW; Range: [0,   5]; The selection of filters to be mixed for NO.4 filter. */
++        td_u16 sbn4  : 3;  /* RW; Range: [0,   5]; The selection of filters to be mixed for NO.4 filter. */
++        td_u16 pbr4  : 5;  /* RW; Range: [0,  16]; The mix ratio between spn and sbr. */
++        td_u16 _rb1_ : 5;
++    };
++
++    td_u8 sfs5;           /* RW; Range: [0, 255]; The NR strength parameters for NO.5 filters. */
++    td_u8 sft5;           /* RW; Range: [0, 255]; The NR strength parameters for NO.5 filters. */
++    td_u8 sbr5;           /* RW; Range: [0, 255]; The NR strength parameters for NO.5 filters. */
++    td_u8 reserved2;
++
++    td_u16  sth1;        /* RW; Range: [0, 511]; The thresholds for protection of edges from blurring. */
++    td_u16  sth2;        /* RW; Range: [0, 511]; The thresholds for protection of edges from blurring. */
++    td_u16  sth3;        /* RW; Range: [0, 511]; The thresholds for protection of edges from blurring. */
++    struct {
++        td_u16 sfn0 : 4; /* RW; Range: [0, 6]; Filter selection for different foreground image areas based on sth1. */
++        td_u16 sfn1 : 4; /* RW; Range: [0, 6]; Filter selection for different foreground image areas based on sth1. */
++        td_u16 sfn2 : 4; /* RW; Range: [0, 6]; Filter selection for different foreground image areas based on sth2. */
++        td_u16 sfn3 : 4; /* RW; Range: [0, 6]; Filter selection for different foreground image areas based on sth3. */
++    };
++    td_u8 bri_str[OT_NR_S_IDX_LEN];   /* RW; Range: [0, 255];  Spatial NR strength based on brightness. */
++    td_u8 bri_idx;                    /* RW; Range: [0, 6]; The filter selection based on brightness */
++    td_u8 k_mode;               /* RW; Range: [0, 1]; mode selection of k filter */
++    td_u8 sbs_k[33];            /* RW; Range: [0, 255]; the filter strength of k filter depending on brightness */
++    td_u8 sds_k[33];            /* RW; Range: [0, 255]; the filter strength of k filter depending on brightness */
++    td_u8 reserved3;
++} ot_nr_v1_adv_sfy;
++
++typedef struct {
++    td_u8 adv_mode; /* RW; Range: [0, 3]; */
++    ot_nr_v1_adv_iey adv_ie_y[2];
++    ot_nr_v1_adv_sfy adv_sf_y[2];
++} ot_ai3dnr_adv_v1;
++
++typedef struct {
++    ot_ai3dnr_adv_v1 adv_param;
++} ot_ai3dnr_manual_adv_param;
++
++typedef struct {
++    td_u32 param_num;
++    ot_ai3dnr_adv_v1 ATTRIBUTE *adv_param;
++} ot_ai3dnr_auto_adv_param;
++
++typedef struct {
++    ot_op_mode op_mode;
++    ot_ai3dnr_manual_adv_param manual_adv_param;
++    ot_ai3dnr_auto_adv_param auto_adv_param;
++} ot_ai3dnr_adv_param_v1;
++
++typedef struct {
++    ot_nr_version           nr_version;          /* RW; Version of 3DNR parameters. */
++    union {
++        ot_ai3dnr_adv_param_v1 nr_adv_param_v1;    /* AUTO: ot_nr_version:OT_NR_V1. */
++    };
++} ot_ai3dnr_adv_param;
++
++typedef enum {
++    OT_NR_TYPE_VIDEO_NORM = 0,
++    OT_NR_TYPE_SNAP_NORM,
++    OT_NR_TYPE_VIDEO_SPATIAL,
++    OT_NR_TYPE_VIDEO_ENHANCED,
++    OT_NR_TYPE_BUTT
++} ot_nr_type;
++
++typedef enum {
++    OT_NR_MOTION_MODE_NORM = 0,              /* Normal. */
++    OT_NR_MOTION_MODE_COMPENSATION,          /* Motion compensate. */
++    OT_NR_MOTION_MODE_BUTT
++} ot_nr_motion_mode;
++
++typedef struct {
++    /* ies0~3 for different frequency response. */
++    td_u8 ies0;     /* RW; Range: [0, 255]; The gains of edge and texture enhancement. */
++    td_u8 ies1;     /* RW; Range: [0, 255]; The gains of edge and texture enhancement. */
++    td_u8 ies2;     /* RW; Range: [0, 255]; The gains of edge and texture enhancement. */
++    td_u8 ies3;     /* RW; Range: [0, 255]; The gains of edge and texture enhancement. */
++    td_u16 iedz;    /* RW; Range: [0, 999]; The threshold to control the generated artifacts. */
++    td_u8 o_sht;    /* RW; Range: [0, 255]; The gains to control the overshoot. */
++    td_u8 u_sht;    /* RW; Range: [0, 255]; The gains to control the undershoot. */
++} ot_nr_v1_iey;
++
++typedef struct {
++    struct {
++        td_u16 spn    : 4;  /* RW; Range: [0,   5]; The selection of filters to be mixed for NO.6 filter. */
++        td_u16 sbn    : 4;  /* RW; Range: [0,   5]; The selection of filters to be mixed for NO.6 filter. */
++        td_u16 pbr    : 5;  /* RW; Range: [0,  16]; The mix ratio between spn and sbr. */
++        td_u16 j_mode : 2;  /* RW; Range: [0,   2]; The selection modes for the blending of spatial filters. */
++        td_u16 _rb_   : 1;  /* RW; Reserved */
++    };
++
++    td_u8 sfr6[4];     /* RW; Range: [0, 31]; The relative NR strength for NO.6 filter. (Effective when jmode = 2). */
++    td_u8 sbr6[2];     /* RW; Range: [0, 15]; The control of overshoot and undershoot. */
++
++    td_u8 sfs1;        /* RW; Range: [0, 255]; The NR strength parameters for NO.1 filter. */
++    td_u8 sbr1;        /* RW; Range: [0, 255]; The NR strength parameters for NO.1 filter. */
++    td_u8 sfs2;        /* RW; Range: [0, 255]; The NR strength parameters for NO.2 filter. */
++    td_u8 sft2;        /* RW; Range: [0, 255]; The NR strength parameters for NO.2 filter. */
++    td_u8 sbr2;        /* RW; Range: [0, 255]; The NR strength parameters for NO.2 filter. */
++    td_u8 sfs4;        /* RW; Range: [0, 255]; The NR strength parameters for NO.3 and NO.4 filters. */
++    td_u8 sft4;        /* RW; Range: [0, 255]; The NR strength parameters for NO.3 and NO.4 filters. */
++    td_u8 sbr4;        /* RW; Range: [0, 255]; The NR strength parameters for NO.3 and NO.4 filters. */
++    /*
++     * sth1_0, sth2_0, sth3_0; Range: [0, 511]; The thresholds for protection of edges on foreground from blurring.
++     * sth1_1, sth2_1, sth3_1; Range: [0, 511]; The thresholds for protection of edges on background from blurring.
++     * bri_idx0, bri_idx1; Range: [0, 7]; The filter selection based on brightness
++     * for foreground and background, respectively.
++     */
++    td_u16 sth1_0;
++    td_u16 sth2_0;
++    td_u16 sth3_0;
++    td_u16 sth1_1;
++    td_u16 sth2_1;
++    td_u16 sth3_1;
++
++    /*
++     * sfn0_0~sfn3_0; Range: [0, 6]; Filter selection for different foreground image areas based on sth1_0~sth3_0.
++     * sfn0_1~sfn3_1; Range: [0, 6]; Filter selection for different background image areas based on sth1_1~sth3_1.
++     */
++    struct {
++        td_u16 sfn0_0 : 4;
++        td_u16 sfn1_0 : 4;
++        td_u16 sfn2_0 : 4;
++        td_u16 sfn3_0 : 4;
++    };
++    struct {
++        td_u16 sfn0_1 : 4;
++        td_u16 sfn1_1 : 4;
++        td_u16 sfn2_1 : 4;
++        td_u16 sfn3_1 : 4;
++    };
++    td_u8 bri_str[OT_NR_S_IDX_LEN]; /* RW ; Range: [0, 255];  Spatial NR strength based on brightness. */
++    struct {
++        td_u8 bri_idx0 : 3;     /* RW; Range: [0, 6]; The filter selection based on brightness */
++        td_u8 bri_idx1 : 3;     /* RW; Range: [0, 6]; The filter selection based on brightness */
++        td_u8 reserved1 : 2;
++    };
++    td_u8 k_mode;               /* RW; Range: [0, 2]; mode selection of k filter */
++    td_u8 sbs_k[33];            /* RW; Range: [0, 255]; the filter strength of k filter depending on brightness */
++    td_u8 sds_k[33];            /* RW; Range: [0, 255]; the filter strength of k filter depending on brightness */
++    td_u8 reserved2;
++} ot_nr_v1_sfy;
++
++typedef struct {
++    struct {
++        td_u16 tfs0   : 4;   /* RW; Range: [0,  15]; The NR strength for temporal filtering. */
++        td_u16 tdz0   : 10;  /* RW; Range: [0, 999]; Protection of the weak texture area from temporal filtering. */
++        td_u16 ref_en : 1;   /* RW; Range: [0,  1];  The switch the reference frame. */
++        td_u16 _rb0_  : 1;
++    };
++    struct {
++        td_u16 tfs1      : 4;   /* RW; Range: [0,  15]; The NR strength for temporal filtering. */
++        td_u16 tdz1      : 10;  /* RW; Range: [0, 999]; Protection of the weak texture area from temporal filtering. */
++        td_u16 math_mode : 1;   /* RW; Range: [0,   1]; The motion detection mode. */
++        td_u16 _rb1_     : 1;
++    };
++    td_u8   tss0;       /* RW; Range: [0,  15]; The ratio for blending spatial NR with the temporal NR results. */
++    td_u8   tss1;       /* RW; Range: [0,  15]; The ratio for blending spatial NR with the temporal NR results. */
++
++    td_u16 auto_math;   /* RW; Range: [0, 999]; The motion threshold for the Level 0 denoise. */
++    td_u8 tfr0[6];      /* RW; Range: [0,  31]; The temporal NR strength control for background (static) area. */
++    td_u8 tfr1[6];      /* RW; Range: [0,  31]; The temporal NR strength control for background (static) area. */
++} ot_nr_v1_tfy;
++
++typedef struct {
++    struct {
++        td_u16 math0 : 10;   /* RW; Range: [0, 999]; The threshold for motion detection. */
++        td_u16 mate0 : 4;    /* RW; Range: [0,   8]; The motion index for smooth image area. */
++        td_u16 adv_math : 2; /* RW; Range: [0,   2]; The mode selection for motion detection. */
++    };
++    struct {
++        td_u16 math1 : 10;  /* RW; Range: [0, 999]; The threshold for motion detection. */
++        td_u16 mate1 : 4;   /* RW; Range: [0,   8]; The motion index for smooth image area. */
++        td_u16 _rb1_ : 2;
++    };
++    td_u8   mabw0;          /* RW; Range: [5,   9]; The window size for motion detection. */
++    td_u8   mabw1;          /* RW; Range: [5,   9]; The window size for motion detection. */
++
++    td_u16 artc;           /* RW; Range: [0, 255]; The artifact control for motion */
++    td_u16 mcth;           /* RW; Range: [0, 999]; The sensitivity for motion */
++    td_u16 dci_w;          /* RW; Range: [0, 999]; The temporal gain for dci gain */
++} ot_nr_v1_mdy;
++
++typedef struct {
++    td_u8 sfc_enhance;     /* RW; Range: [0, 255];  The chroma NR strength for sfc. */
++    td_u8 sfc_ext;         /* RW; Range: [0, 255];  The extra chroma NR strength for sfc. */
++    td_u8 trc;             /* RW; Range: [0, 255];  The temporal chroma NR strength. */
++    td_u8 reserved;
++    struct {
++        td_u16 sfc   : 8;   /* RW; Range: [0, 255];  The motion threshold for chroma. */
++        td_u16 tfc   : 6;   /* RW; Range: [0, 63];   The control of temporal chroma NR strength. */
++        td_u16 _rb0_ : 2;
++    };
++    td_u8 tpc;              /* RW; Range: [0, 1];  Chroma denoise mode. */
++    td_u8 pre_sfc;          /* RW; Range: [0, 31];  pre-chroma denoise. */
++} ot_nr_v1_nrc0;
++
++typedef struct {
++    td_u8 sfs2;      /* RW; Range: [0, 255];  The NR strength parameters for NO.2 filter. */
++    td_u8 sft2;      /* RW; Range: [0, 255];  The NR strength parameters for NO.2 filter. */
++    td_u8 sbr2;      /* RW; Range: [0, 255];  The NR strength parameters for NO.2 filter. */
++    struct {
++        td_u16 pbr0  : 4;    /* RW; Range: [0, 15]; The mix ratio. */
++        td_u16 pbr1  : 4;    /* RW; Range: [0, 15]; The mix ratio. */
++        td_u16 _rb0_ : 8;
++    };
++} ot_nr_v1_nrc1;
++
++typedef struct {
++    ot_nr_v1_iey  iey[5];
++    ot_nr_v1_sfy  sfy[5];
++    ot_nr_v1_mdy  mdy[2];
++    ot_nr_v1_tfy  tfy[3];
++    ot_nr_v1_nrc0 nrc0;
++    ot_nr_v1_nrc1 nrc1;
++
++    struct {
++        td_u8 limit_range_en : 1;  /* RW; Range: [0, 1]; The switch for limit range mode. */
++        td_u8 nry0_en        : 1;  /* RW; Range: [0, 1]; The switch for luma denoise. */
++        td_u8 nry1_en        : 1;  /* RW; Range: [0, 1]; The switch for luma denoise. */
++        td_u8 nry2_en        : 1;  /* RW; Range: [0, 1]; The switch for luma denoise. */
++        td_u8 nry3_en        : 1;  /* RW; Range: [0, 1]; The switch for luma denoise. */
++        td_u8 nrc0_en        : 1;  /* RW; Range: [0, 1]; The switch for chroma denoise. */
++        td_u8 nrc1_en        : 1;  /* RW; Range: [0, 1]; The switch for chroma denoise. */
++        td_u8 _rb_           : 1;
++    };
++} ot_nr_v1;
++
++typedef struct {
++    td_u16 coarse_g1;   /* RW; Range: [0, 1023];   The sharpen gain of coarse region for No.1 Sharpen filter. */
++    td_u16 fine_g1;     /* RW; Range: [0, 1023];   The sharpen gain of fine region for No.1 Sharpen filter. */
++    td_u16 coarse_g2;   /* RW; Range: [0, 1023];   The sharpen gain of coarse region for No.2 Sharpen filter. */
++    td_u16 fine_g2;     /* RW; Range: [0, 1023];   The sharpen gain of fine region for No.2 Sharpen filter. */
++    td_u16 coarse_g3;   /* RW; Range: [0, 1023];   The sharpen gain of coarse region for No.3 Sharpen filter. */
++    td_u16 fine_g3;     /* RW; Range: [0, 1023];   The sharpen gain of fine region for No.3 Sharpen filter. */
++    td_u16 coarse_g4;   /* RW; Range: [0, 1023];   The sharpen gain of coarse region for No.4 Sharpen filter. */
++    td_u16 fine_g4;     /* RW; Range: [0, 1023];   The sharpen gain of fine region for No.4 Sharpen filter. */
++    td_u16 o_sht_b : 8; /* RW; Range: [0, 255];      The gains to control the overshoot for background. */
++    td_u16 u_sht_b : 8; /* RW; Range: [0, 255];       The gains to control the undershoot for background. */
++    td_u16 o_sht_f : 8; /* RW; Range: [0, 255];      The gains to control the overshoot for foreground. */
++    td_u16 u_sht_f : 8; /* RW; Range: [0, 255];      The gains to control the undershoot for foreground. */
++    td_u16 sf_bld[17];  /* RW; Range: [0, 63];       The  blending strength of selection filters for No. 7 and No. 8
++                           filter. */
++    td_u16 shp_ctl_mean[17]; /* RW; Range: [0, 63];    The sharpen gain of coarse region based on  mean difference. */
++    td_u16 shp_ctl_dir[17];  /* RW; Range: [0, 63];     The sharpen gain of coarse region based on edge variance. */
++    td_u16 sfn7_0;           /* RW; Range: [0,   4]; Filter selection for No. 7 filter. */
++    td_u16 sfn7_1;           /* RW; Range: [0,   4]; Filter selection for No. 7 filter. */
++    td_u16 sfn8_0;           /* RW; Range: [0,   4]; Filter selection for No. 8 filter. */
++    td_u16 sfn8_1;           /* RW; Range: [0,   4]; Filter selection for No. 8 filter. */
++    td_u16 sth1_0;           /* RW; Range: [0, 511]; The thresholds for protection of edges from blurring */
++    td_u16 sth2_0;           /* RW; Range: [0, 511]; The thresholds for protection of edges from blurring */
++    td_u16 sth3_0;           /* RW; Range: [0, 511]; The thresholds for protection of edges from blurring */
++    td_u16 sth1_1;           /* RW; Range: [0, 511]; The thresholds for protection of edges from blurring */
++    td_u16 sth2_1;           /* RW; Range: [0, 511]; The thresholds for protection of edges from blurring */
++    td_u16 sth3_1;           /* RW; Range: [0, 511]; The thresholds for protection of edges from blurring */
++    td_u16 sfn0_0 : 4;       /* RW; Range: [0,   8]; Filter selection for different image areas based on sth1_0~3. */
++    td_u16 sfn1_0 : 4;       /* RW; Range: [0,   8]; Filter selection for different image areas based on sth1_0~3. */
++    td_u16 sfn2_0 : 4;       /* RW; Range: [0,   8]; Filter selection for different image areas based on sth1_0~3. */
++    td_u16 sfn3_0 : 4;       /* RW; Range: [0,   8]; Filter selection for different image areas based on sth1_0~3. */
++    td_u16 sfn0_1 : 4;       /* RW; Range: [0,   8]; Filter selection for different image areas based on sth1_0~3. */
++    td_u16 sfn1_1 : 4;       /* RW; Range: [0,   8]; Filter selection for different image areas based on sth1_0~3. */
++    td_u16 sfn2_1 : 4;       /* RW; Range: [0,   8]; Filter selection for different image areas based on sth1_0~3. */
++    td_u16 sfn3_1 : 4;       /* RW; Range: [0,   8]; Filter selection for different image areas based on sth1_0~3. */
++} ot_nr_v2_pshrp;            /*   nry4  */
++
++typedef struct {
++    td_u8 sfs1;    /* RW; Range: [0, 255];  The NR strength parameters for NO.1 filter. */
++    td_u8 sbr1;    /* RW; Range: [0, 255];  The NR strength parameters for NO.1 filter. */
++    td_u8 sfs2;    /* RW; Range: [0, 255];  The NR strength parameters for NO.2 filter. */
++    td_u8 sft2;    /* RW; Range: [0, 255];  The NR strength parameters for NO.2 filter. */
++    td_u8 sbr2;    /* RW; Range: [0, 255];  The NR strength parameters for NO.2 filter. */
++    td_u8 strf3;   /* RW; Range: [0, 31];  The NR strength parameters of foreground for NO.3 filter. */
++    td_u8 strb3;   /* RW; Range: [0, 31];  The NR strength parameters of background for NO.3 filter. */
++    td_u8 sfs4;    /* RW; Range: [0, 255];  The NR strength parameters for NO.4 filter. */
++    td_u8 sft4;    /* RW; Range: [0, 255];  The NR strength parameters for NO.4 filter. */
++    td_u8 sbr4;    /* RW; Range: [0, 255];  The NR strength parameters for NO.4 filter. */
++    td_u8 strf4;   /* RW; Range: [0, 31];  The NR strength parameters of foreground for NO.4 filter. */
++    td_u8 strb4;   /* RW; Range: [0, 31];  The NR strength parameters of background for NO.4 filters. */
++    td_u8 sfs5;    /* RW; Range: [0, 255];  The NR strength parameter for NO.5 filters. */
++    td_u16 bld6;   /* RW; Range: [0,   16]; The blending strength  for No. 6 filter. */
++    td_u16 sth1_0; /* RW; Range: [0, 511]; The thresholds for protection of edges from blurring */
++    td_u16 sth2_0; /* RW; Range: [0, 511]; The thresholds for protection of edges from blurring */
++    td_u16 sth3_0; /* RW; Range: [0, 511]; The thresholds for protection of edges from blurring */
++    td_u16 sth1_1; /* RW; Range: [0, 511]; The thresholds for protection of edges from blurring */
++    td_u16 sth2_1; /* RW; Range: [0, 511]; The thresholds for protection of edges from blurring */
++    td_u16 sth3_1; /* RW; Range: [0, 511]; The thresholds for protection of edges from blurring */
++    td_u16 sfn0_0; /* RW; Range: [0,   8]; Filter selection for different image areas based on sth1_0~3. */
++    td_u16 sfn1_0; /* RW; Range: [0,   8]; Filter selection for different image areas based on sth1_0~3. */
++    td_u16 sfn2_0; /* RW; Range: [0,   8]; Filter selection for different image areas based on sth1_0~3. */
++    td_u16 sfn3_0; /* RW; Range: [0,   8]; Filter selection for different image areas based on sth1_0~3. */
++    td_u16 sfn0_1; /* RW; Range: [0,   8]; Filter selection for different image areas based on sth1_0~3. */
++    td_u16 sfn1_1; /* RW; Range: [0,   8]; Filter selection for different image areas based on sth1_0~3. */
++    td_u16 sfn2_1; /* RW; Range: [0,   8]; Filter selection for different image areas based on sth1_0~3. */
++    td_u16 sfn3_1; /* RW; Range: [0,   8]; Filter selection for different image areas based on sth1_0~3. */
++    td_u8 sfn6_0;  /* RW; Range: [0,   5]; Filter selection for No. 6 filter. */
++    td_u8 sfn6_1;  /* RW; Range: [0,   5]; Filter selection for No. 6 filter. */
++    td_u8 sfn7_0;  /* RW; Range: [0,   5]; Filter selection for No. 7 filter. */
++    td_u8 sfn7_1;  /* RW; Range: [0,   5]; Filter selection for No. 7 filter. */
++    td_u8 sfn8_0;  /* RW; Range: [0,   5]; Filter selection for No. 8 filter. */
++    td_u8 sfn8_1;  /* RW; Range: [0,   5]; Filter selection for No. 8 filter. */
++} ot_nr_v2_sfy;    /*   nry1   nry2   nry3    */
++
++typedef struct {
++    td_u8 tfs0 : 4;   /* RW;         Range: [0,  15]; The NR strength for temporal filtering. */
++    td_u8 tfs1 : 4;   /* RW;         Range: [0,  15]; The NR strength for temporal filtering. */
++    td_u8 tfs2 : 4;   /* RW;         Range: [0,  15]; The NR strength for temporal filtering. */
++    td_u8 ref_en : 1; /* RW;         Range: [0,  1]; The switch for temporal filtering. */
++    td_u8 _rb_ : 3;
++    td_u8 tss0;   /* RW;         Range: [0,  31]; The NR strength for spatial filtering. */
++    td_u8 tss1;   /* RW;         Range: [0,  31]; The NR strength for spatial filtering. */
++    td_u8 tss2;   /* RW;         Range: [0,  31]; The NR strength for spatial filtering. */
++    td_u8 tfr0[6];      /* RW; Range: [0,  31]; The temporal NR strength control for background (static) area. */
++    td_u8 tfr1[6];      /* RW; Range: [0,  31]; The temporal NR strength control for background (static) area. */
++    td_u8 tfs0_mot[17];   /* RW; Range: [0,  16];  */
++    td_u8 tfs1_mot[17];   /* RW; Range: [0,  16];  */
++    td_u8 tfs_mode;    /* RW; Range: [0,  1];  */
++} ot_nr_v2_tfy;       /*  nry1  nry2  */
++
++typedef struct {
++    td_u16 math0;     /* RW;   Range: [0, 999]; The threshold for motion detection. */
++    td_u16 mate0; /* RW;   Range: [0,   8]; The motion index for smooth image area. */
++    td_u16 math1;     /* RW;   Range: [0, 999]; The threshold for motion detection. */
++    td_u16 mate1; /* RW;   Range: [0,   8]; The motion index for smooth image area. */
++    td_u8 mabw0 : 4;  /* RW;   Range: [5,   9]; The window size for motion detection. */
++    td_u8 mabw1 : 4;  /* RW;   Range: [5,   9]; The window size for motion detection. */
++} ot_nr_v2_mdy;       /*  nry1  nry2 */
++
++typedef struct {
++    td_u16 tfs;    /* RW;         Range: [0,  15]; The NR strength for temporal filtering. */
++    td_u16 math : 8;  /* RW;   Range: [0, 255]; The high threshold for motion detection. */
++    td_u16 mathd : 8; /* RW;   Range: [0, 255]; The low threshold for motion detection. */
++    td_u8 mabw;   /* RW;   Range: [0,   2]; The window size for motion detection. */
++    td_u8 tdz;    /* RW;   Range: [0, 255]; The deadzone for motion detection. */
++    td_u8 tfs_mot[17];   /* RW; Range: [0,  16];  */
++} ot_nr_v2_mdy0; /* nry0  */
++
++typedef struct {
++    td_u8 sf_var_f[17];  /* RW;   Range: [0, 63]; The NR strength of No.3 and No.4 filter for foreground region based on
++                             variance.  */
++    td_u8 sf_var_b[17];  /* RW;   Range: [0, 63]; The NR strength of No.3 and No.4 filter for background region based on
++                             variance.  */
++    td_u8 sf_dir_f[17]; /* RW;   Range: [0, 63]; The NR strength of No.3 and No.4 filter for foreground region based on
++                           edge variance.  */
++    td_u8 sf_dir_b[17]; /* RW;   Range: [0, 63]; The NR strength of No.3 and No.4 filter for background region based on
++                           edge variance.  */
++    td_u8 sf_bri_f[17];  /* RW;   Range: [0, 63]; The NR strength of No.3 and No.4 filter for foreground region based on
++                             brightness.  */
++    td_u8 sf_bri_b[17];  /* RW;   Range: [0, 63]; The NR strength of No.3 and No.4 filter for background region based on
++                             brightness.  */
++    td_u8 sf5_var_f[17];  /* RW;   Range: [0, 63]; The NR strength of No.5 filter for foreground region based on
++                             variance.  */
++    td_u8 sf5_var_b[17];  /* RW;   Range: [0, 63]; The NR strength of No.5 filter for background region based on
++                             variance.  */
++    td_u8 sf5_bri_f[17];  /* RW;   Range: [0, 63]; The NR strength of No.5 filter for foreground region based on
++                             brightness.  */
++    td_u8 sf5_bri_b[17];  /* RW;   Range: [0, 63]; The NR strength of No.5 filter for background region based on
++                             brightness.  */
++    td_u8 sf5_dir_f[17];  /* RW;   Range: [0, 63]; The NR strength of No.5 filter for foreground region based on edge
++                             variance.  */
++    td_u8 sf5_dir_b[17];  /* RW;   Range: [0, 63]; The NR strength of No.5 filter for background region based on edge
++                             variance.  */
++    td_u8 sf5_sad_f[17];  /* RW;   Range: [0, 63];  */
++    td_u8 sf_cor[17];    /* RW;   Range: [0, 63];   */
++    td_u8 sf5_cor[17];    /* RW;   Range: [0, 63];   */
++    td_u8 sf_mot[17];    /* RW;   Range: [0, 16];   */
++    td_u8 sf5_mot[17];    /* RW;   Range: [0, 16];   */
++    td_u8 var_by_bri[17]; /* RW;   Range: [0, 63];  */
++    td_u8 sf_bld[17];       /* RW;   Range: [0, 63]; The blending strength for No.6, No.7 and No.8 filter.  */
++} ot_nr_v2_sfy_lut;       /*  nry2   nry3  */
++
++
++typedef struct {
++    td_u16 gamma_lut[33]; /* RW;   Range: [0, 255];  */
++    td_u8 gamma_en;   /* RW;   Range: [0, 1]; The switch of post gamma.  */
++    td_u8 ca_lut[33];     /* RW;   Range: [0, 63];   */
++    td_u8 ca_en;      /* RW;   Range: [0, 1]; The switch of post ca.  */
++} ot_nr_v2_pp;
++
++typedef struct {
++    td_u8 trc;         /* RW; Range: [0, 255];  The temporal chroma NR strength. */
++    td_u8 sfc;     /* RW; Range: [0, 255];  The motion threshold for chroma. */
++    td_u8 tfc;     /* RW; Range: [0, 63];   The control of temporal chroma NR strength. */
++    td_u8 tfs;     /* RW; Range: [0,  15]; The NR strength for temporal filtering. */
++    td_u8 tfs_mot[17]; /* RW; Range: [0,  16]; The motion mapping function based on motion map. */
++} ot_nr_v2_nrc0;
++
++typedef struct {
++    td_u8 pre_sfs; /* RW; Range: [0,  16]; The pre-processing of spacial filter. motion mapping function based on motion
++                      map. */
++    td_u8 sfs1;    /* RW; Range: [0, 255];  The NR strength parameters for NO.1 filter. */
++    td_u8 sfs1_mot[17];   /* RW; Range: [0,  16]; The motion mapping function based on motion map. */
++    td_u8 sfs2_coarse;   /* RW; Range: [0, 31];  The total NR strength parameters for NO.2 filter */
++    td_u8 sfs2_coarse_f; /* RW; Range: [0, 31];  The background NR strength parameters for NO.2 filter. */
++    td_u8 sfs2_fine_f;   /* RW; Range: [0, 16];  The foreground NR strength parameters for NO.2 filter */
++    td_u8 sfs2_fine_b;   /* RW; Range: [0, 16];  The background NR strength parameters for NO.2 filter */
++    td_u8 sfs2_mot[16];   /* RW; Range: [0,  16]; The motion mapping function based on motion map. */
++    td_u16 sfs2_sat[20];  /* RW; Range: [0,  1023]; The motion mapping function based on motion map. */
++    td_u8 sfs2_mode;      /* RW; Range: [0,  1];  */
++} ot_nr_v2_nrc1;
++
++typedef struct {
++    ot_nr_v2_pshrp iey;
++    ot_nr_v2_sfy sfy[3];
++    ot_nr_v2_mdy mdy[2];
++    ot_nr_v2_tfy tfy[2];
++    ot_nr_v2_nrc0 nrc0;
++    ot_nr_v2_nrc1 nrc1;
++    ot_nr_v2_sfy_lut luty[2];
++    ot_nr_v2_pp pp;
++    ot_nr_v2_mdy0 mdy0;
++    struct {
++        td_u8 nry1_en : 1;          /* RW; Range: [0, 1]; The switch for luma denoise. */
++        td_u8 nry2_en : 1;          /* RW; Range: [0, 1]; The switch for luma denoise. */
++        td_u8 nry3_en : 1;          /* RW; Range: [0, 1]; The switch for luma denoise. */
++        td_u8 nry4_en : 1;          /* RW; Range: [0, 1]; The switch for luma denoise. */
++        td_u8 nrc0_mode : 1;        /* RW; Range: [0, 1]; The mode selection for nrc0 denoise. */
++        td_u8 nrc_en : 1;           /* RW; Range: [0, 1]; The switch for chroma denoise. */
++    };
++} ot_nr_v2;
++
++typedef struct {
++    ot_nr_v1 nr_param;
++} ot_nr_param_manual_v1;
++
++typedef struct {
++    td_u32 param_num;
++    td_u32 ATTRIBUTE *iso;
++    ot_nr_v1 ATTRIBUTE *nr_param;
++} ot_nr_param_auto_v1;
++
++typedef struct {
++    ot_op_mode op_mode;
++    ot_nr_param_manual_v1 nr_manual;
++    ot_nr_param_auto_v1 nr_auto;
++} ot_nr_norm_param_v1;
++
++typedef struct {
++    td_u32 param_num;
++    td_u32 ATTRIBUTE *iso;
++    ot_nr_v2 ATTRIBUTE *nr_param;
++} ot_nr_param_auto_v2;
++
++typedef struct {
++    ot_nr_v2 nr_param;
++} ot_nr_param_manual_v2;
++
++typedef struct {
++    ot_op_mode op_mode;
++    ot_nr_param_manual_v2 nr_manual;
++    ot_nr_param_auto_v2 nr_auto;
++} ot_nr_norm_param_v2;
++
++typedef struct {
++    td_u32                   mdz;                 /* RW; Range: [0, 63]; */
++    td_u32                   hard_tf_strength;    /* RW; Range: [0, 96]; Relation strength of hard NR channel. */
++    /* Only for weak nr chn */
++    td_u32                   edz;                 /* RW; Range: [0, 63]; */
++    td_u32                   weak_tf_strength;    /* RW; Range: [0, 63]; Relation strength of weak NR channel. */
++} ot_nr_adv_param;
++
++typedef struct {
++    ot_nr_version           nr_version;          /* RW; Version of 3DNR parameters. */
++    union {
++        ot_nr_norm_param_v1 nr_norm_param_v1;    /* AUTO: ot_nr_version:OT_NR_V1. */
++        ot_nr_norm_param_v2 nr_norm_param_v2;    /* AUTO: ot_nr_version:OT_NR_V2. */
++    };
++} ot_3dnr_param;
++
++typedef struct {
++    td_bool            enable;
++    ot_nr_type         nr_type;        /* RW; 3DNR type. */
++    ot_compress_mode   compress_mode;  /* RW; Reference frame compression mode. */
++    ot_nr_motion_mode  nr_motion_mode; /* RW; 3DNR motion compensate mode. */
++} ot_3dnr_attr;
++
++typedef struct {
++    ot_isp_hdr_info isp_hdr;
++    td_u32 iso;
++    td_u32 init_iso;
++    td_u8 sns_wdr_mode;
++} ot_isp_attach_info;
++
++typedef struct {
++    ot_color_gamut color_gamut;
++} ot_isp_colorgammut_info;
++
++typedef struct {
++    td_u32 numerator;   /* represents the numerator of a fraction. */
++    td_u32 denominator; /* the denominator. */
++} ot_dng_rational;
++
++/* defines the structure of DNG image dynamic information */
++typedef struct {
++    /* RO; range: [0x0, 0xFFFF]; black level. */
++    td_u32 black_level[OT_ISP_BAYER_CHN];
++    /*
++     * specifies the selected white balance at time of capture,
++     * encoded as the coordinates of a perfectly neutral color in linear reference space values.
++     */
++    ot_dng_rational as_shot_neutral[OT_CFACOLORPLANE];
++    /* RO; describes the amount of noise in a raw image */
++    td_double ad_noise_profile[OT_DNG_NP_SIZE];
++} ot_dng_image_dynamic_info;
++
++typedef struct {
++    td_u32 iso;
++    td_u32 isp_dgain;
++    td_u32 exposure_time;
++    td_u32 white_balance_gain[OT_ISP_WB_GAIN_NUM];
++    td_u32 color_temperature;
++    td_u16 cap_ccm[OT_ISP_CAP_CCM_NUM];
++} ot_isp_config_info;
++
++typedef struct {
++    td_bool enable;         /* RW; low delay enable. */
++    td_u32  line_cnt;       /* RW; range: [16, 8192]; low delay shoreline. */
++    td_bool one_buf_en;     /* RW; one buffer for low delay enable. */
++} ot_low_delay_info;
++
++typedef enum {
++    OT_SCHEDULE_NORMAL = 0,
++    OT_SCHEDULE_QUICK,
++    OT_SCHEDULE_BUTT
++} ot_schedule_mode;
++
++/* spread correction attribute */
++typedef struct {
++    /* RW; range: [0, 1];whether enable spread or not, when spread on,ldc distortion_ratio range should be [0, 500] */
++    td_bool enable;
++    td_u32  spread_coef; /* RW; range: [0, 18];strength coefficient of spread correction */
++} ot_spread_attr;
++
++/* dest_point */
++typedef struct {
++    td_s64 motion_data[OT_DIS_MOTIONDATA_NUM];
++} ot_dis_motion_data;
++
++typedef struct {
++    ot_dis_motion_data data;
++    td_bool valid;
++} ot_dis_motion_info;
++
++typedef struct {
++    td_s32 point_num;
++    ot_point point[OT_DIS_POINT_NUM];
++} ot_dst_point_info;
++
++typedef struct {
++    ot_dis_motion_info gme_motion_data;
++    ot_dis_motion_info fliter_motion_data;
++    ot_dst_point_info dst_point_info;
++    td_s32 private_data[OT_DIS_PRIVATE_NUM];
++} ot_dis_motion_data_info;
++
++typedef struct {
++    td_bool    aspect;      /* RW;range: [0, 1];whether aspect ration  is keep */
++    td_s32     x_ratio;     /* RW; range: [0, 100]; field angle ration of  horizontal,valid when aspect=0. */
++    td_s32     y_ratio;     /* RW; range: [0, 100]; field angle ration of  vertical,valid when aspect=0. */
++    td_s32     xy_ratio;    /* RW; range: [0, 100]; field angle ration of  all,valid when aspect=1. */
++     /* RW; range: [-511, 511]; horizontal offset of the image distortion center relative to image center. */
++    td_s32 center_x_offset;
++     /* RW; range: [-511, 511]; vertical offset of the image distortion center relative to image center. */
++    td_s32 center_y_offset;
++    /* RW; range: [-300, 500]; LDC distortion ratio.when spread on,distortion_ratio range should be [0, 500] */
++    td_s32 distortion_ratio;
++} ot_ldc_v1_attr;   /* Not supported for Hi3516CV610 */
++
++typedef struct {
++    td_bool    aspect;      /* RW;range: [0, 1];whether aspect ration  is keep */
++    td_s32     x_ratio;     /* RW; range: [0, 100]; field angle ration of  horizontal,valid when aspect=0. */
++    td_s32     y_ratio;     /* RW; range: [0, 100]; field angle ration of  vertical,valid when aspect=0. */
++    td_s32     xy_ratio;    /* RW; range: [0, 100]; field angle ration of  all,valid when aspect=1. */
++    /* RW; range: [6400, 3276700]; focal length in horizontal direction, with 2 decimal numbers */
++    td_s32 focal_len_x;
++    /* RW; range: [6400, 3276700]; focal length in vertical direction, with 2 decimal numbers */
++    td_s32 focal_len_y;
++    /* RW; range: [35*width, 65*width]; coordinate of image center, with 2 decimal numbers */
++    td_s32 coord_shift_x;
++    /* RW; range: [35*height, 65*height]; Y coordinate of image center, with 2 decimal numbers */
++    td_s32 coord_shift_y;
++    /* RW; lens distortion coefficients of the source image, with 5 decimal numbers */
++    td_s32 src_calibration_ratio[OT_SRC_LENS_COEF_NUM];
++    /* RW; lens distortion coefficients of the source image (for interpolation), with 5 decimal numbers */
++    td_s32 src_calibration_ratio_next[OT_SRC_LENS_COEF_NUM];
++    td_u32 coef_intp_ratio; /* RW; range: [0, 32768]; interpolation ratio between two coefficient sets, 15bits */
++} ot_ldc_v2_attr;   /* Not supported for Hi3516CV610 */
++
++typedef struct {
++    /* RW; range: [6400, 117341700]; focal length in horizontal direction, with 2 decimal numbers */
++    td_s32 focal_len_x;
++    /* RW; range: [6400, 117341700]; focal length in vertical direction, with 2 decimal numbers */
++    td_s32 focal_len_y;
++    /* RW; range: [35*width, 65*width]; coordinate of image center, with 2 decimal numbers */
++    td_s32 coord_shift_x;
++    /* RW; range: [35*height, 65*height]; Y coordinate of image center, with 2 decimal numbers */
++    td_s32 coord_shift_y;
++    /* RW; range: [-1600000, 1600000]; lens distortion coefficients of the source image, with 5 decimal numbers
++        src_calibration_ratio[0]: 100000; src_calibration_ratio[8]: [0, 3200000] */
++    td_s32 src_calibration_ratio[OT_SRC_LENS_COEF_NUM];
++    /* RW; range: [-1600000, 1600000]; lens distortion coefficients, with 5 decimal numbers
++        dst_calibration_ratio[12]: [0, 1600000]; dst_calibration_ratio[13]: [0, 1600000] */
++    td_s32 dst_calibration_ratio[OT_DST_LENS_COEF_NUM];
++    /* RW; range: [0, 1048576]; max undistorted distance before 3rd polynomial drop, with 16bits decimal */
++    td_s32 max_du;
++} ot_dis_ldc_attr;   /* Not supported for Hi3516CV610 */
++
++typedef enum  {
++    OT_LDC_VIEW_TYPE_ALL   = 0, /* View scale all but x and y independently, this will keep both x and y axis ,
++                                   but corner maybe lost */
++    OT_LDC_VIEW_TYPE_CROP  = 1, /* Not use view scale, this will lost some side and corner */
++    OT_LDC_VIEW_TYPE_BUTT
++} ot_ldc_view_type;
++
++typedef struct {
++    ot_ldc_view_type view_type; /* RW; range: [0, 1], 0: all mode, 1: crop mode. */
++    td_s32 center_x_offset;    /* RW; range: ABS(center_x_offset)->[0, min(128, width*0.08)], horizontal offset
++                                of the image distortion center relative to image center. */
++    td_s32 center_y_offset;    /* RW; range: ABS(center_y_offset)->[0, min(128, height*0.08)], vertical offset of
++                                the image distortion center relative to image center. */
++    td_s32 distortion_ratio;  /* RW; range: [-300, 300], LDC distortion ratio. */
++    td_s32 min_ratio;         /* RW; range: [-300, 300], to remove the black region around when performing
++                                pinchusion distortion correction with crop mode. */
++} ot_ldc_v3_attr;   /* Not supported for Hi3519DV500 */
++
++typedef enum {
++    OT_LDC_V1 = 0,
++    OT_LDC_V2 = 1,
++    OT_LDC_V3 = 2,
++
++    OT_LDC_VERSION_BUTT
++} ot_ldc_version;
++
++typedef struct {
++    td_bool enable;                 /* RW; Range [0,1]; Whether LDC is enable */
++    ot_ldc_version ldc_version;     /* RW; Version of LDC */
++    union {
++        ot_ldc_v1_attr ldc_v1_attr; /* RW; Attribute of LDC v1. AUTO:ot_ldc_version:OT_LDC_V1; */
++        ot_ldc_v2_attr ldc_v2_attr; /* RW; Attribute of LDC v2. AUTO:ot_ldc_version:OT_LDC_V2; */
++        ot_ldc_v3_attr ldc_v3_attr; /* RW; Attribute of LDC v3. AUTO:ot_ldc_version:OT_LDC_V3; */
++    };
++} ot_ldc_attr;
++
++/* gdc PMF attr */
++typedef struct {
++    td_bool enable;                          /* RW; Range [0,1]; Whether or not pmf is enable */
++    ot_size dst_size;
++    td_s64  pmf_coef[OT_GDC_COMMON_COEF_NUM]; /* RW; PMF coefficient of gdc */
++} ot_pmf_attr;
++
++
++/* gdc FOV attr */
++typedef struct {
++    td_bool enable;                          /* RW; Range [0,1]; Whether or not fov is enable */
++    td_s64 fov_coef[OT_GDC_COMMON_COEF_NUM]; /* RW; matrix for match the two */
++} ot_fov_attr;
++
++typedef enum {
++    OT_LUT_CELL_SIZE_16,
++    OT_LUT_CELL_SIZE_32,
++    OT_LUT_CELL_SIZE_64,
++    OT_LUT_CELL_SIZE_128,
++    OT_LUT_CELL_SIZE_256,
++
++    OT_LUT_CELL_SIZE_BUTT
++} ot_lut_cell_size;
++
++typedef struct {
++    ot_size          in_size;   /* gdc input size, default: grp_attr.max_width, grp_attr.max_height */
++    ot_lut_cell_size cell_size; /* gdc function cell size, default:OT_LUT_CELL_SIZE_16 */
++} ot_gdc_param;
++
++typedef struct {
++    ot_size             in_size;        /* lut in size */
++    ot_size             out_size;       /* lut out size */
++    ot_lut_cell_size    cell_size;      /* lut cell size */
++    td_phys_addr_t      lut_phys_addr;  /* phys addr of lut */
++    td_u32              lut_len;        /* length of lut */
++} ot_lut;
++
++typedef enum {
++    OT_LUT_CONNECT_MODE,
++    OT_LUT_FUSION_MODE,
++    OT_LUT_MODE_BUTT
++} ot_lut_mode;
++
++typedef struct {
++    td_bool     pre_lut_en;     /* RW; Range [0,1]; Whether or not the pre lut is enable */
++    ot_lut      pre_lut;        /* RW; pre lut */
++    td_bool     post_lut_en;    /* RW; Range [0,1]; Whether or not the post lut is enable */
++    ot_lut      post_lut;       /* RW; post lut */
++    ot_lut_mode lut_mode;       /* RW; lut mode */
++    td_u32      ratio;          /* RW; range: [0, 32768]; fusion ratio of two lut */
++} ot_lut_attr;
++
++typedef struct {
++    td_u32  blend_position; /* RW; blend position, the beginning of the blend range */
++    td_u32  blend_range; /* RW; blend range, within blend area */
++} ot_blend_param;
++
++typedef struct {
++    td_u32         buf_num; /* RW; Range [0, 5]; buffer number of blend area */
++    ot_blend_param blend_param[OT_GDC_MAX_STITCH_NUM - 1]; /* RW; param of stitch blend */
++} ot_stitch_blend_param;
++
++typedef struct {
++    td_s32 isp_pipe[OT_GDC_MAX_STITCH_NUM]; /* W; isp pipe of bind stitch in pipe */
++    td_u32 milli_sec; /* W; Range [100, 10000]; sync time interval, millisecond */
++    td_u8 smooth_strength; /* W; Range [1, 16]; vertical filter window size */
++    td_u8 shading_adjust_threshold; /* W; Range [0, 255]; shading gain range */
++} ot_stitch_luma_sync_param;
++
++typedef enum {
++    OT_STITCH_BLEND, /* Stitching in blend mode. */
++    OT_STITCH_NOBLEND_VER, /* Vertical stitching, no blending. */
++    OT_STITCH_NOBLEND_HOR, /* Horizontal stitching, no blending. */
++    OT_STITCH_NOBLEND_QR, /* Quarter stitching, no blending. */
++
++    OT_STITCH_BUTT
++} ot_stitch_mode;
++
++typedef enum {
++    OT_STITCH_CORRECTION_CYLINDRICAL,
++    OT_STITCH_CORRECTION_LUT,
++    OT_STITCH_CORRECTION_BUTT,
++} ot_stitch_correction_mode;
++
++typedef struct {
++    td_bool pmf_enable;      /* RW; Range [0, 1]; Whether or not pmf is enable */
++    td_s64  pmf_coef[OT_GDC_COMMON_COEF_NUM]; /* RW; PMF coefficient of gdc */
++    td_s32  center_x_offset; /* RW; offset of x; Range [-511, 511] */
++    td_s32  center_y_offset; /* RW; offset of y; Range [-511, 511] */
++    td_u32  ratio;           /* RW: ratio of cylindrical projection; Range [0, 500]  */
++    ot_size dst_size;        /* RW: destination size of stitch pipe */
++} ot_cylindrical_attr;
++
++typedef union {
++    /* attribute of cylindrical mode. AUTO:ot_stitch_correction_mode: OT_STITCH_CORRECTION_CYLINDRICAL; */
++    ot_cylindrical_attr cylindrical_attr;
++    /* attribute of lut mode. AUTO:ot_stitch_correction_mode: OT_STITCH_CORRECTION_LUT; */
++    ot_lut              lut;
++} ot_stitch_correction_attr;
++
++typedef struct {
++    td_bool         enable; /* RW; Range [0, 1]; Whether or not stitch is enable */
++    td_u32          pipe_num; /* RW; Range [2, 4]; stitch pipe number */
++    td_bool         sync_pipe_en; /* RW; Range [0, 1]; sync pipe with pts or not */
++    ot_stitch_mode  stitch_mode; /* RW; stitch mode: blend/noblend_ver/noblend_hor/noblend_qr */
++    ot_point        overlap_point[OT_GDC_MAX_STITCH_NUM][2]; /* RW; start and end position of overlap area */
++    ot_stitch_correction_mode correction_mode; /* RW; correction mode: cylindrical/lut */
++    ot_stitch_correction_attr correction_attr[OT_GDC_MAX_STITCH_NUM]; /* RW; attribute of correction */
++} ot_stitch_attr;
++
++typedef struct {
++    td_bool enable; /* RW; Range: [0, 1]; Zoom enable. */
++    ot_coord mode;  /* RW; Coordinate mode of zoom. */
++    ot_rect rect;   /* RW; Zoom rectangular. */
++} ot_zoom_attr;
++
++typedef enum {
++    OT_3DNR_POS_VI,
++    OT_3DNR_POS_VPSS,
++
++    OT_3DNR_POS_BUTT
++} ot_3dnr_pos_type;
++
++typedef enum {
++    OT_FMU_MODE_OFF,
++    OT_FMU_MODE_WRAP,
++    OT_FMU_MODE_DIRECT,
++
++    OT_FMU_MODE_BUTT
++} ot_fmu_mode;
++
++typedef enum {
++    OT_FMU_ID_VI = 0,
++    OT_FMU_ID_VPSS = 1,
++
++    OT_FMU_ID_BUTT
++} ot_fmu_id;
++
++typedef struct {
++    td_bool wrap_en;
++    td_u32  page_num;
++} ot_fmu_attr;
++
++typedef struct {
++    td_u32            width;
++    td_u32            height;
++    td_u32            align;
++    ot_data_bit_width bit_width;
++    ot_pixel_format   pixel_format;
++    ot_compress_mode  compress_mode;
++    ot_video_format   video_format;
++} ot_pic_buf_attr;
++
++typedef enum {
++    OT_VENC_SVC_V1 = 0,
++    OT_VENC_SVC_V2,
++    OT_VENC_SVC_BUTT,
++} ot_venc_svc_version;
++
++typedef struct {
++    td_bool           share_buf_en;
++    td_u32            frame_buf_ratio;
++    ot_pic_buf_attr   pic_buf_attr;
++    /*
++     * when share_buf_en is enabled,
++     * the memory allocated by SVC_V1 is less than that allocated by SVC_V2.
++     */
++    ot_venc_svc_version svc_version;
++} ot_venc_buf_attr;
++
++typedef enum {
++    OT_SCALE_COEF_TYPE_NORMAL = 0,
++    OT_SCALE_COEF_TYPE_BILINEAR,
++    OT_SCALE_COEF_TYPE_BUTT
++} ot_scale_coef_type;
++
++#ifdef __cplusplus
++}
++#endif /* __cplusplus */
++
++#endif /* OT_COMMON_VIDEO_H */
+diff --git a/sdk/hi3516cv6xx/include/ot_debug.h b/sdk/hi3516cv6xx/include/ot_debug.h
+new file mode 100644
+index 0000000..54d3a7c
+--- /dev/null
++++ b/sdk/hi3516cv6xx/include/ot_debug.h
+@@ -0,0 +1,191 @@
++/*
++  Copyright (c), 2001-2025, Shenshu Tech. Co., Ltd.
++ */
++
++#ifndef OT_DEBUG_H
++#define OT_DEBUG_H
++
++#ifndef __KERNEL__
++#include <stdio.h>
++#include <stdarg.h>
++#else
++#include "ot_osal.h"
++#endif
++
++#include "ot_type.h"
++#include "ot_common.h"
++
++#ifdef __cplusplus
++#if __cplusplus
++extern "C" {
++#endif
++#endif /* __cplusplus */
++
++#define _EX__FILE_LINE(fxx, lxx) "[File]:" fxx"\n[Line]:"#lxx"\n[Info]:"
++#define EX__FILE_LINE(fxx, lxx) _EX__FILE_LINE(fxx, lxx)
++#define __FILE_LINE__ EX__FILE_LINE(__FILE__, __LINE__)
++#define OT_MAX_MOD_NAME_LEN 16
++
++#define OT_DBG_EMERG      0   /* system is unusable                   */
++#define OT_DBG_ALERT      1   /* action must be taken immediately     */
++#define OT_DBG_CRIT       2   /* critical conditions                  */
++#define OT_DBG_ERR        3   /* error conditions                     */
++#define OT_DBG_WARN       4   /* warning conditions                   */
++#define OT_DBG_NOTICE     5   /* normal but significant condition     */
++#define OT_DBG_INFO       6   /* informational                        */
++#define OT_DBG_DEBUG      7   /* debug-level messages                 */
++
++#if (!defined(__KERNEL__)) || defined(CONFIG_OT_LOG_TRACE_SUPPORT)
++/* Using samples:   ot_assert(x>y); */
++#define ot_assert(expr)                    \
++    do {                                   \
++        if (!(expr)) {                     \
++            OT_ASSERT_LOG("\nASSERT at:\n" \
++                  "  >Function : %s\n"     \
++                  "  >Line No. : %d\n"     \
++                  "  >Condition: %s\n",    \
++                  __FUNCTION__, __LINE__, #expr); \
++        } \
++    } while (0)
++
++#endif
++#ifndef __KERNEL__
++/*
++ * For User Mode : OT_PRINT, ot_assert, OT_TRACE
++ */
++#define OT_PRINT      printf
++#define OT_ASSERT_LOG printf
++
++/* #ifdef OT_DEBUG */
++#ifdef CONFIG_OT_LOG_TRACE_SUPPORT
++
++    /*
++     * Using samples:
++     * OT_TRACE(OT_DBG_DEBUG, OT_ID_MEM, "Test %d, %s\n", 12, "Test");
++     */
++#define OT_TRACE(level, enModId, fmt...) \
++    do {                                 \
++        if (level <= OT_DBG_ERR)         \
++            fprintf(stderr, ##fmt);         \
++    } while (0)
++
++#else   /* #ifdef CONFIG_OT_LOG_TRACE_SUPPORT */
++    #define OT_TRACE(level, enModId, fmt...)
++#endif  /* #ifdef CONFIG_OT_LOG_TRACE_SUPPORT */
++
++#else   /* #ifndef __KERNEL__ */
++/*
++ * For Linux Kernel : OT_PRINT, ot_assert, OT_TRACE
++ */
++#define OT_PRINT      osal_printk
++
++int OT_LOG(td_s32 level, ot_mod_id mod_id, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
++
++/* #ifdef OT_DEBUG */
++#ifdef CONFIG_OT_LOG_TRACE_SUPPORT
++
++#ifdef OT_DEBUG
++#define OT_ASSERT_LOG   osal_panic
++#else
++#define OT_ASSERT_LOG   osal_printk
++#endif  /* #ifdef OT_DEBUG */
++
++    /*
++     * Using samples:
++     * OT_TRACE(OT_DBG_DEBUG, OT_ID_MEM, "Test %d, %s\n", 12, "Test");
++     */
++#define OT_TRACE OT_LOG
++#else   /* #ifdef CONFIG_OT_LOG_TRACE_SUPPORT */
++#define ot_assert(expr) ot_unused(expr)
++#define OT_TRACE(level, enModId, fmt...)
++#endif  /* #ifdef CONFIG_OT_LOG_TRACE_SUPPORT */
++
++#endif /* end of __KERNEL__ */
++
++#if (CONFIG_OT_LOG_TRACE_LEVEL >= OT_DBG_EMERG)
++
++#define OT_EMERG_TRACE(mod, fmt...) OT_TRACE(OT_DBG_EMERG, mod, fmt)
++
++#else
++#define OT_EMERG_TRACE(mod, fmt...)
++#endif
++
++#if (CONFIG_OT_LOG_TRACE_LEVEL >= OT_DBG_ALERT)
++
++#define OT_ALERT_TRACE(mod, fmt...) OT_TRACE(OT_DBG_ALERT, mod, fmt)
++
++#else
++#define OT_ALERT_TRACE(mod, fmt...)
++#endif
++
++#if (CONFIG_OT_LOG_TRACE_LEVEL >= OT_DBG_CRIT)
++
++#define OT_CRIT_TRACE(mod, fmt...) OT_TRACE(OT_DBG_CRIT, mod, fmt)
++
++#else
++#define OT_CRIT_TRACE(mod, fmt...)
++#endif
++
++#if (CONFIG_OT_LOG_TRACE_LEVEL >= OT_DBG_ERR)
++
++#define OT_ERR_TRACE(mod, fmt...) OT_TRACE(OT_DBG_ERR, mod, fmt)
++
++#else
++#define OT_ERR_TRACE(mod, fmt...)
++#endif
++
++#if (CONFIG_OT_LOG_TRACE_LEVEL >= OT_DBG_WARN)
++
++#define OT_WARN_TRACE(mod, fmt...) OT_TRACE(OT_DBG_WARN, mod, fmt)
++
++#else
++#define OT_WARN_TRACE(mod, fmt...)
++#endif
++
++#if (CONFIG_OT_LOG_TRACE_LEVEL >= OT_DBG_NOTICE)
++
++#define OT_NOTICE_TRACE(mod, fmt...) OT_TRACE(OT_DBG_NOTICE, mod, fmt)
++
++#else
++#define OT_NOTICE_TRACE(mod, fmt...)
++#endif
++
++#if (CONFIG_OT_LOG_TRACE_LEVEL >= OT_DBG_INFO)
++
++#define OT_INFO_TRACE(mod, fmt...) OT_TRACE(OT_DBG_INFO, mod, fmt)
++
++#else
++#define OT_INFO_TRACE(mod, fmt...)
++#endif
++
++#if (CONFIG_OT_LOG_TRACE_LEVEL >= OT_DBG_DEBUG)
++
++#define OT_DEBUG_TRACE(mod, fmt...) OT_TRACE(OT_DBG_DEBUG, mod, fmt)
++
++#else
++#define OT_DEBUG_TRACE(mod, fmt...)
++#endif
++
++#define MPI_STATIC
++
++typedef struct {
++    ot_mod_id  mod_id;
++    td_s32  level;
++    td_char mod_name[OT_MAX_MOD_NAME_LEN];
++} ot_log_level_cfg;
++
++#ifndef __KERNEL__
++
++#else
++
++int ot_log(td_s32 level, ot_mod_id mod_id, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
++
++#endif /* end of __KERNEL__ */
++
++#ifdef __cplusplus
++#if __cplusplus
++}
++#endif
++#endif /* __cplusplus */
++
++#endif /* OT_DEBUG_H */
+diff --git a/sdk/hi3516cv6xx/include/ot_defines.h b/sdk/hi3516cv6xx/include/ot_defines.h
+new file mode 100644
+index 0000000..4b474e6
+--- /dev/null
++++ b/sdk/hi3516cv6xx/include/ot_defines.h
+@@ -0,0 +1,555 @@
++/*
++  Copyright (c), 2001-2025, Shenshu Tech. Co., Ltd.
++ */
++
++#ifndef OT_DEFINES_H
++#define OT_DEFINES_H
++
++#include "autoconf.h"
++
++#ifdef __cplusplus
++#if __cplusplus
++extern "C" {
++#endif
++#endif /* __cplusplus */
++
++#ifndef OT_CHIP
++#define OT_CHIP                          CONFIG_OT_SUBCHIP_TYPE
++#endif
++
++#define OT_CHIP_HI3516DV500                    0x3516D500
++#define OT_CHIP_HI3519DV500                    0x3519D500
++#define OT_CHIP_SD3403V100                     0xd3403100
++#define OT_CHIP_SD3491V100                     0xd3491100
++#define OT_CHIP_HI3516CV610                    0x3516C610
++
++#if OT_CHIP == OT_CHIP_HI3516DV500
++#define OT_CHIP_NAME                       "HI3516DV500"
++#elif OT_CHIP == OT_CHIP_HI3519DV500
++#define OT_CHIP_NAME                       "HI3519DV500"
++#elif OT_CHIP == OT_CHIP_HI3516CV610
++#define OT_CHIP_NAME                       "HI3516CV610"
++#else
++#error OT_CHIP define may be error
++#endif
++
++#define OT_MAX_BIND_DST_NUM                4
++#define OT_MPP_VER_PRIX                    "_MPP_V"
++
++#define OT_MAX_COLOR_COMPONENT             2
++#define OT_ALIGN_NUM                       4
++#define OT_MAX_PRIVATE_DATA_NUM            2
++#define OT_MAX_USER_DATA_NUM               2
++#define OT_LUMA_PHYS_ALIGN                  32
++
++#define OT_DEFAULT_ALIGN                   8
++#define OT_MAX_ALIGN                       1024
++#define OT_SEG_COMPRESS_LEN                256
++
++#define OT_MAX_MMZ_NAME_LEN                32
++
++#define OT_QUAD_POINT_NUM                  4
++
++/* For VB */
++#define OT_VB_MAX_POOLS                  96
++
++/* For VENC */
++#define OT_VENC_VEDU_IP_NUM              1
++#define OT_VENC_JPGE_IP_NUM              1
++#define OT_VENC_MAX_TILE_NUM             1
++#define OT_VENC_MAX_REG_NUM              2
++#define OT_VENC_MAX_CHN_NUM              16
++#define OT_VENC_H264_MAX_WIDTH           4096
++#define OT_VENC_H264_MAX_HEIGHT          4096
++#define OT_VENC_H264_MIN_WIDTH           114
++#define OT_VENC_H264_MIN_HEIGHT          114
++#define OT_VENC_H265_MAX_WIDTH           4096
++#define OT_VENC_H265_MAX_HEIGHT          4096
++#define OT_VENC_H265_MIN_WIDTH           114
++#define OT_VENC_H265_MIN_HEIGHT          114
++#define OT_VENC_JPEG_MAX_WIDTH           16384
++#define OT_VENC_JPEG_MAX_HEIGHT          16384
++#define OT_VENC_JPEG_MIN_WIDTH           32
++#define OT_VENC_JPEG_MIN_HEIGHT          32
++#define OT_VENC_MAX_INPUT_FRAME_RATE     240
++#define OT_VENC_MIN_INPUT_FRAME_RATE     1
++#define OT_VENC_MAX_RECV_SRC             4
++#define OT_VENC_H265_ADAPTIVE_FRAME_TYPE 4
++#define OT_VENC_H265_ADAPTIVE_QP_TYPE    5
++#define OT_VENC_H265E_LCU_SIZE           32
++#define OT_VENC_SVAC3_MAX_WIDTH           4096
++#define OT_VENC_SVAC3_MAX_HEIGHT          4096
++#define OT_VENC_SVAC3_MIN_WIDTH           114
++#define OT_VENC_SVAC3_MIN_HEIGHT          114
++#define OT_VENC_SVAC3_ADAPTIVE_FRAME_TYPE 4
++#define OT_VENC_SVAC3_ADAPTIVE_QP_TYPE    5
++#define OT_VENC_SVAC3E_LCU_SIZE           32
++#define OT_VENC_MAX_IN_DEPTH              3
++
++/* For RC */
++#define OT_VENC_MAX_BITRATE              (160 * 1024)
++#define OT_VENC_MIN_BITRATE              2
++
++/* For VDEC */
++#define OT_VDEC_MAX_CHN_NUM                8
++#define OT_VFMW_MAX_CHN_NUM                8
++
++#define OT_H264D_ALIGN_W                   64
++#define OT_H264D_ALIGN_H                   16
++#define OT_H265D_ALIGN_W                   64
++#define OT_H265D_ALIGN_H                   64
++#define OT_JPEGD_ALIGN_W                   64
++#define OT_JPEGD_ALIGN_H                   16
++
++#define OT_H264D_MAX_SPS                   32
++#define OT_H264D_MIN_SPS                   1
++#define OT_H264D_MAX_PPS                   256
++#define OT_H264D_MIN_PPS                   1
++#define OT_H264D_MAX_SLICE                 600
++#define OT_H264D_MIN_SLICE                 1
++
++#define OT_H265D_MAX_VPS                   16
++#define OT_H265D_MIN_VPS                   1
++#define OT_H265D_MAX_SPS                   16
++#define OT_H265D_MIN_SPS                   1
++#define OT_H265D_MAX_PPS                   64
++#define OT_H265D_MIN_PPS                   1
++#define OT_H265D_MAX_SLICE                 600
++#define OT_H265D_MIN_SLICE                 1
++
++#define OT_H264D_MAX_WIDTH                 6144
++#define OT_H264D_MAX_HEIGHT                6144
++#define OT_H264D_MIN_WIDTH                 114
++#define OT_H264D_MIN_HEIGHT                114
++#define OT_H265D_MAX_WIDTH                 6144
++#define OT_H265D_MAX_HEIGHT                6144
++#define OT_H265D_MIN_WIDTH                 114
++#define OT_H265D_MIN_HEIGHT                114
++#define OT_VDH_MIN_MSG_NUM                 1
++#define OT_VDH_MAX_MSG_NUM                 8
++#define OT_VEDU_MSG_NUM                    2
++
++#define OT_JPEGD_IP_NUM                    1
++#define OT_JPEGD_MAX_WIDTH                 16384
++#define OT_JPEGD_MAX_HEIGHT                16384
++#define OT_JPEGD_MIN_WIDTH                 8
++#define OT_JPEGD_MIN_HEIGHT                8
++
++/* For Region */
++#define OT_RGN_MIN_WIDTH                   2
++#define OT_RGN_MIN_HEIGHT                  2
++#define OT_RGN_ALIGN                       2
++
++#define OT_RGN_COVER_MIN_X                 (-4096)
++#define OT_RGN_COVER_MIN_Y                 (-4096)
++#define OT_RGN_COVER_MAX_X                 4094
++#define OT_RGN_COVER_MAX_Y                 4094
++#define OT_RGN_COVER_MAX_WIDTH             4096
++#define OT_RGN_COVER_MAX_HEIGHT            4096
++#define OT_RGN_COVER_MIN_THICK             2
++#define OT_RGN_COVER_MAX_THICK             16
++#define OT_RGN_COVER_THICK_ALIGN           2
++
++#define OT_RGN_COVEREX_MIN_X               (-4096)
++#define OT_RGN_COVEREX_MIN_Y               (-4096)
++#define OT_RGN_COVEREX_MAX_X               4094
++#define OT_RGN_COVEREX_MAX_Y               4094
++#define OT_RGN_COVEREX_MAX_WIDTH           4096
++#define OT_RGN_COVEREX_MAX_HEIGHT          4096
++#define OT_RGN_COVEREX_MIN_THICK           2
++#define OT_RGN_COVEREX_MAX_THICK           16
++#define OT_RGN_COVEREX_THICK_ALIGN         2
++
++#define OT_RGN_OVERLAY_MIN_X               0
++#define OT_RGN_OVERLAY_MIN_Y               0
++#define OT_RGN_OVERLAY_MAX_X               4094
++#define OT_RGN_OVERLAY_MAX_Y               4094
++#define OT_RGN_OVERLAY_MAX_WIDTH           4096
++#define OT_RGN_OVERLAY_MAX_HEIGHT          4096
++#define OT_RGN_OVERLAY_MIN_ALPHA           0
++#define OT_RGN_OVERLAY_MAX_ALPHA           255
++#define OT_RGN_OVERLAY_VENC_MAX_ALPHA      255
++
++#define OT_RGN_OVERLAYEX_MIN_X             0
++#define OT_RGN_OVERLAYEX_MIN_Y             0
++#define OT_RGN_OVERLAYEX_MAX_X             4094
++#define OT_RGN_OVERLAYEX_MAX_Y             4094
++#define OT_RGN_OVERLAYEX_MAX_WIDTH         4096
++#define OT_RGN_OVERLAYEX_MAX_HEIGHT        4096
++#define OT_RGN_OVERLAYEX_MIN_ALPHA         0
++#define OT_RGN_OVERLAYEX_MAX_ALPHA         255
++
++#define OT_RGN_LINEEX_MIN_X                (-4096)
++#define OT_RGN_LINEEX_MIN_Y                (-4096)
++#define OT_RGN_LINEEX_MAX_X                4094
++#define OT_RGN_LINEEX_MAX_Y                4094
++#define OT_RGN_LINEEX_MIN_THICK            2
++#define OT_RGN_LINEEX_MAX_THICK            16
++
++#define OT_RGN_CORNER_RECT_MIN_X           (-4096)
++#define OT_RGN_CORNER_RECT_MIN_Y           (-4096)
++#define OT_RGN_CORNER_RECT_MAX_X           4094
++#define OT_RGN_CORNER_RECT_MAX_Y           4094
++#define OT_RGN_CORNER_RECT_MIN_THICK       2
++#define OT_RGN_CORNER_RECT_MAX_THICK       16
++#define OT_RGN_CORNER_RECT_THICK_ALIGN     2
++
++#define OT_RGN_CORNER_RECT_MAX_WIDTH       4096
++#define OT_RGN_CORNER_RECT_MAX_HEIGHT      4096
++#define OT_RGN_CORNER_RECT_MIN_HOR_LEN     2
++#define OT_RGN_CORNER_RECT_MAX_HOR_LEN     4096
++#define OT_RGN_CORNER_RECT_MIN_VER_LEN     2
++#define OT_RGN_CORNER_RECT_MAX_VER_LEN     4096
++
++#define OT_RGN_CORNER_RECTEX_MIN_X         (-4096)
++#define OT_RGN_CORNER_RECTEX_MIN_Y         (-4096)
++#define OT_RGN_CORNER_RECTEX_MAX_X         4094
++#define OT_RGN_CORNER_RECTEX_MAX_Y         4094
++#define OT_RGN_CORNER_RECTEX_MIN_THICK     2
++#define OT_RGN_CORNER_RECTEX_MAX_THICK     16
++#define OT_RGN_CORNER_RECTEX_THICK_ALIGN   2
++
++#define OT_RGN_CORNER_RECTEX_MAX_WIDTH     4096
++#define OT_RGN_CORNER_RECTEX_MAX_HEIGHT    4096
++#define OT_RGN_CORNER_RECTEX_MIN_HOR_LEN   2
++#define OT_RGN_CORNER_RECTEX_MAX_HOR_LEN   4096
++#define OT_RGN_CORNER_RECTEX_MIN_VER_LEN   2
++#define OT_RGN_CORNER_RECTEX_MAX_VER_LEN   4096
++
++#define OT_RGN_HANDLE_MAX                  128
++#define OT_RGN_MAX_BUF_NUM                 2
++
++#define OT_RGN_VI_MAX_COVEREX_NUM          16
++
++#define OT_RGN_VENC_MAX_OVERLAY_NUM        8
++
++#define OT_RGN_VPSS_MAX_COVER_NUM          8
++#define OT_RGN_VPSS_MAX_RECT_COVER_NUM     8
++#define OT_RGN_VPSS_MAX_QUAD_COVER_NUM     0
++#define OT_RGN_VPSS_MAX_COVEREX_NUM        8
++#define OT_RGN_VPSS_MAX_OVERLAYEX_NUM      8
++#define OT_RGN_VPSS_MAX_LINEEX_NUM         40
++#define OT_RGN_VPSS_MAX_CORNER_RECT_NUM    4
++#define OT_RGN_VPSS_MAX_CORNER_RECTEX_NUM  4
++
++#define OT_RGN_VGS_MAX_TASK_WIDTH          8192
++
++/* For vi */
++#define OT_VI_MAX_DEV_NUM                 2
++#define OT_VI_MAX_PHYS_PIPE_NUM           2
++#define OT_VI_MAX_VIRT_PIPE_NUM           2
++#define OT_VI_MAX_PIPE_NUM                (OT_VI_MAX_PHYS_PIPE_NUM + OT_VI_MAX_VIRT_PIPE_NUM)
++#define OT_VI_MAX_STITCH_GRP_NUM          2
++#define OT_VI_MAX_WDR_FUSION_GRP_NUM      OT_VI_MAX_PIPE_NUM
++#define OT_VI_MAX_DISTRIBUTE_GRP_NUM      2
++#define OT_VI_MAX_DISTRIBUTE_PIPE_NUM     2
++#define OT_VI_MAX_WDR_NUM                 2
++#define OT_VI_MAX_WDR_FRAME_NUM           2
++#define OT_VI_MAX_PHYS_CHN_NUM            1
++#define OT_VI_MAX_EXT_CHN_NUM             1
++#define OT_VI_EXT_CHN_START               OT_VI_MAX_PHYS_CHN_NUM
++#define OT_VI_MAX_CHN_NUM                 (OT_VI_MAX_PHYS_CHN_NUM + OT_VI_MAX_EXT_CHN_NUM)
++#define OT_VI_MAX_EXTCHN_BIND_PER_CHN     8
++
++#define OT_VI_MAX_SPLIT_NODE_NUM          2
++
++#define OT_VI_MIN_BNR_BUF_NUM             2
++#define OT_VI_MAX_BNR_BUF_NUM             128
++
++#define OT_VI_DEV_MIN_WIDTH               120
++#define OT_VI_DEV_MIN_HEIGHT              80
++#define OT_VI_DEV_MAX_WIDTH               4096
++#define OT_VI_DEV_MAX_HEIGHT              4096
++
++#define OT_VI_PIPE_OFFLINE_MIN_WIDTH      120
++#define OT_VI_PIPE_OFFLINE_MIN_HEIGHT     80
++#define OT_VI_PIPE_OFFLINE_RAW_MIN_HEIGHT 120
++#define OT_VI_PIPE_OFFLINE_MAX_WIDTH      4096
++#define OT_VI_PIPE_OFFLINE_MAX_HEIGHT     4096
++
++#define OT_VI_PIPE_ONLINE_MIN_WIDTH       120
++#define OT_VI_PIPE_ONLINE_MIN_HEIGHT      80
++#define OT_VI_PIPE_ONLINE_RAW_MIN_HEIGHT  120
++#define OT_VI_PIPE_ONLINE_MAX_WIDTH       3200
++#define OT_VI_PIPE_ONLINE_MAX_HEIGHT      4096
++
++#define OT_VI_PHYS_CHN_OFFLINE_MIN_WIDTH  120
++#define OT_VI_PHYS_CHN_OFFLINE_MIN_HEIGHT 80
++#define OT_VI_PHYS_CHN_OFFLINE_MAX_WIDTH  4096
++#define OT_VI_PHYS_CHN_OFFLINE_MAX_HEIGHT 4096
++
++#define OT_VI_PHYS_CHN_ONLINE_MIN_WIDTH   120
++#define OT_VI_PHYS_CHN_ONLINE_MIN_HEIGHT  80
++#define OT_VI_PHYS_CHN_ONLINE_MAX_WIDTH   3200
++#define OT_VI_PHYS_CHN_ONLINE_MAX_HEIGHT  4096
++
++#define OT_VI_EXT_CHN_MIN_WIDTH           32
++#define OT_VI_EXT_CHN_MIN_HEIGHT          32
++#define OT_VI_EXT_CHN_MAX_WIDTH           4096
++#define OT_VI_EXT_CHN_MAX_HEIGHT          4096
++#define OT_VI_EXT_CHN_MAX_ZOOMIN          16
++#define OT_VI_EXT_CHN_MAX_ZOOMOUT         30
++
++#define OT_VI_COMPRESS_PARAM_SIZE         152
++
++/* For DIS */
++#define OT_DIS_PYRAMID_LAYER_NUM          5
++#define OT_DIS_MAX_CHN_NUM                4
++#define OT_DIS_MAX_IMAGE_WIDTH            8192
++#define OT_DIS_MIN_IMAGE_WIDTH            120
++#define OT_DIS_MAX_IMAGE_HEIGHT           8192
++#define OT_DIS_MIN_IMAGE_HEIGHT           88
++
++/* For VO */
++#define OT_VO_MAX_PHYS_DEV_NUM            1  /* max physical dev num */
++#define OT_VO_MAX_VIRT_DEV_NUM            0  /* max virtual dev num */
++#define OT_VO_MAX_CAS_DEV_NUM             0  /* max cascade dev num */
++/* max dev num */
++#define OT_VO_MAX_DEV_NUM                 (OT_VO_MAX_PHYS_DEV_NUM + OT_VO_MAX_VIRT_DEV_NUM + OT_VO_MAX_CAS_DEV_NUM)
++
++#define OT_VO_MAX_PHYS_VIDEO_LAYER_NUM    1 /* max physical video layer num */
++#define OT_VO_MAX_GFX_LAYER_NUM           1 /* max graphic layer num */
++/* max physical layer num */
++#define OT_VO_MAX_PHYS_LAYER_NUM          (OT_VO_MAX_PHYS_VIDEO_LAYER_NUM + OT_VO_MAX_GFX_LAYER_NUM)
++/* max layer num */
++#define OT_VO_MAX_LAYER_NUM               (OT_VO_MAX_PHYS_LAYER_NUM + OT_VO_MAX_VIRT_DEV_NUM + OT_VO_MAX_CAS_DEV_NUM)
++#define OT_VO_MAX_LAYER_IN_DEV            2 /* max video layer num of each dev */
++
++#define OT_VO_LAYER_V0                    0 /* video layer 0 */
++#define OT_VO_LAYER_G0                    1 /* graphics layer 0 */
++#define OT_VO_MAX_PRIORITY                1      /* max layer priority */
++#define OT_VO_MIN_TOLERATE                1      /* min play toleration 1ms */
++#define OT_VO_MAX_TOLERATE                100000 /* max play toleration 100s */
++
++#define OT_VO_MAX_CHN_NUM                 4    /* max chn num */
++#define OT_VO_MIN_CHN_WIDTH               32   /* channel minimal width */
++#define OT_VO_MIN_CHN_HEIGHT              32   /* channel minimal height */
++#define OT_VO_MAX_ZOOM_RATIO              1000 /* max zoom ratio, 1000 means 100% scale */
++#define OT_VO_MAX_NODE_NUM                16   /* max node num */
++
++#define OT_VO_MAX_WBC_NUM                 0     /* max wbc num */
++#define OT_VO_MAX_IMG_WIDTH               16384 /* vo max img width */
++#define OT_VO_MAX_IMG_HEIGHT              8192  /* vo max img height */
++
++/* For AVS */
++#define OT_AVS_MAX_GRP_NUM                32
++#define OT_AVS_PIPE_NUM                   4
++#define OT_AVS_SPLIT_PIPE_NUM             4
++#define OT_AVS_MAX_CHN_NUM                2
++#define OT_AVS_SPLIT_NUM                  2
++#define OT_AVS_CUBE_MAP_SURFACE_NUM       6
++
++#define OT_AVS_BLEND_MIN_IN_WIDTH         1280
++#define OT_AVS_BLEND_MIN_IN_HEIGHT        720
++#define OT_AVS_NO_BLEND_MIN_IN_WIDTH      64
++#define OT_AVS_NO_BLEND_MIN_IN_HEIGHT     64
++#define OT_AVS_MAX_IN_WIDTH               8192
++#define OT_AVS_MAX_IN_HEIGHT              8192
++
++#define OT_AVS_MIN_OUT_WIDTH              256
++#define OT_AVS_MIN_OUT_HEIGHT             256
++#define OT_AVS_MAX_OUT_WIDTH              16384
++#define OT_AVS_MAX_OUT_HEIGHT             8192
++
++/* For AUDIO */
++#define OT_AI_DEV_MAX_NUM                  1
++#define OT_AO_DEV_MIN_NUM                  0
++#define OT_AO_DEV_MAX_NUM                  1
++#define OT_AIO_MAX_NUM           ((OT_AO_DEV_MAX_NUM > OT_AI_DEV_MAX_NUM) ? OT_AO_DEV_MAX_NUM : OT_AI_DEV_MAX_NUM)
++#define OT_AENC_MAX_CHN_NUM                8
++#define OT_ADEC_MAX_CHN_NUM                8
++
++#define OT_AI_MAX_CHN_NUM                  4
++#define OT_AO_MAX_CHN_NUM                  3
++#define OT_AO_SYS_CHN_ID                  (OT_AO_MAX_CHN_NUM - 1)
++
++#define OT_AIO_MAX_CHN_NUM       ((OT_AO_MAX_CHN_NUM > OT_AI_MAX_CHN_NUM) ? OT_AO_MAX_CHN_NUM : OT_AI_MAX_CHN_NUM)
++
++/* For VPSS */
++#define OT_VPSS_MAX_GRP_NUM             6
++#define OT_VPSS_MAX_GRP_PIPE_NUM        1
++#define OT_VPSS_VGS_GRP_NO              6
++#define OT_VPSS_IP_NUM                  1
++#define OT_VPSS0                        0
++#define OT_VPSS_MAX_PHYS_CHN_NUM        3
++#define OT_VPSS_MAX_EXT_CHN_NUM         2
++#define OT_VPSS_MAX_CHN_NUM             (OT_VPSS_MAX_PHYS_CHN_NUM + OT_VPSS_MAX_EXT_CHN_NUM)
++#define OT_VPSS_MAX_SPLIT_NODE_NUM      2
++#define OT_VPSS_MAX_STITCH_BUF_NUM      5
++#define OT_VPSS_MAX_FPS                 240
++#define OT_VPSS_USER_LIST_MAX_DEPTH     8
++#define OT_VPSS_MAX_OUT_RGN_NUM         1
++#define OT_VPSS_LOW_DELAY_MIN_LINE      16
++#define OT_VPSS_MIN_IMG_WIDTH           64
++#define OT_VPSS_MIN_IMG_HEIGHT          64
++#define OT_VPSS_MAX_IN_IMG_WIDTH        4096
++#define OT_VPSS_MAX_IN_IMG_HEIGHT       4096
++#define OT_VPSS_MAX_OUT_IMG_WIDTH       4096
++#define OT_VPSS_MAX_OUT_IMG_HEIGHT      4096
++#define OT_VPSS_MAX_SEG_COMPACT_WIDTH   4096
++#define OT_VPSS_MAX_ZOOMIN              16
++#define OT_VPSS_MAX_ZOOMOUT             15
++#define OT_VPSS_EXT_CHN_MAX_ZOOMIN      16
++#define OT_VPSS_EXT_CHN_MAX_ZOOMOUT     30
++#define OT_VPSS_EXT_CHN_MAX_IMG_WIDTH   4096
++#define OT_VPSS_EXT_CHN_MAX_IMG_HEIGHT  4096
++
++/* For PCIV */
++#define OT_PCIV_MAX_CHN_NUM                16 /* max pciv channel number in each pciv device */
++
++/* For IVS_MD */
++#define OT_MD_MAX_CHN                      4
++#define OT_MD_MAX_WIDTH                    1920
++#define OT_MD_MAX_HEIGHT                   1080
++#define OT_MD_MIN_WIDTH                    64
++#define OT_MD_MIN_HEIGHT                   64
++
++/* For IVE */
++#define OT_IVE_MAX_ARR_LEN                   512
++#define OT_IVE_MIN_ARR_LEN                   20
++#define OT_IVE_DEFAULT_NODE_NUM              64
++
++/* For RECT */
++#define OT_DPU_RECT_MAX_GRP_NUM           8
++#define OT_DPU_RECT_MAX_PIPE_NUM          2
++#define OT_DPU_RECT_MAX_CHN_NUM           2
++
++#define OT_DPU_RECT_IN_IMAGE_MAX_WIDTH    2048
++#define OT_DPU_RECT_IN_IMAGE_MAX_HEIGHT   2048
++#define OT_DPU_RECT_IN_IMAGE_MIN_WIDTH    64
++#define OT_DPU_RECT_IN_IMAGE_MIN_HEIGHT   64
++#define OT_DPU_RECT_OUT_IMAGE_MAX_WIDTH   2048
++#define OT_DPU_RECT_OUT_IMAGE_MAX_HEIGHT  2048
++#define OT_DPU_RECT_OUT_IMAGE_MIN_WIDTH   64
++#define OT_DPU_RECT_OUT_IMAGE_MIN_HEIGHT  64
++
++/* For MATCH */
++#define OT_DPU_MATCH_MAX_GRP_NUM          8
++#define OT_DPU_MATCH_MAX_PIPE_NUM         2
++#define OT_DPU_MATCH_MAX_CHN_NUM          1
++
++#define OT_DPU_MATCH_IN_IMAGE_MAX_WIDTH   2048
++#define OT_DPU_MATCH_IN_IMAGE_MAX_HEIGHT  2048
++#define OT_DPU_MATCH_IN_IMAGE_MIN_WIDTH   64
++#define OT_DPU_MATCH_IN_IMAGE_MIN_HEIGHT  64
++#define OT_DPU_MATCH_OUT_IMAGE_MAX_WIDTH  2048
++#define OT_DPU_MATCH_OUT_IMAGE_MAX_HEIGHT 2048
++#define OT_DPU_MATCH_OUT_IMAGE_MIN_WIDTH  64
++#define OT_DPU_MATCH_OUT_IMAGE_MIN_HEIGHT 64
++
++/* For NPU */
++#define OT_SVP_NPU_MAX_STREAM_NUM       4
++#define OT_SVP_NPU_MIN_STREAM_NUM       1
++#define OT_SVP_NPU_DEF_STREAM_NUM       4
++#define OT_SVP_NPU_MAX_TASK_NODE_NUM    512
++#define OT_SVP_NPU_MIN_TASK_NODE_NUM    2
++#define OT_SVP_NPU_DEF_TASK_NODE_NUM    32
++#define OT_SVP_NPU_MAX_EVENT_NUM        0
++#define OT_SVP_NPU_MIN_EVENT_NUM        0
++#define OT_SVP_NPU_DEF_EVENT_NUM        0
++#define OT_SVP_NPU_MAX_PROF_MEM_KB      1048576
++#define OT_SVP_NPU_MIN_PROF_MEM_KB      512
++#define OT_SVP_NPU_DEF_PROF_MEM_KB      2048
++#define OT_SVP_NPU_DEF_OPS_SEL          3
++
++/* For VGS */
++#define OT_VGS_IP_NUM                      1
++#define OT_VGS0                            0
++#define OT_VGS_MAX_CHN_NUM                 1
++#define OT_VGS_MAX_CORNER_RECT_NUM         1
++#define OT_VGS_MAX_SOLID_RECT_COVER_NUM    1
++#define OT_VGS_MAX_HOLLOW_RECT_COVER_NUM   OT_VGS_MAX_CORNER_RECT_NUM
++#define OT_VGS_MAX_RECT_COVER_NUM          (OT_VGS_MAX_SOLID_RECT_COVER_NUM + OT_VGS_MAX_HOLLOW_RECT_COVER_NUM)
++#define OT_VGS_MAX_QUAD_COVER_NUM          1
++#define OT_VGS_MAX_COVER_NUM               OT_VGS_MAX_SOLID_RECT_COVER_NUM
++#define OT_VGS_MAX_OSD_NUM                 1
++#define OT_VGS_MAX_MOSAIC_NUM              1
++
++#define OT_VGS_DEFAULT_JOB_NUM             64
++#define OT_VGS_DEFAULT_TASK_NUM            100
++#define OT_VGS_DEFAULT_NODE_NUM            100
++
++#define OT_VGS_MAX_JOB_NUM                 200
++#define OT_VGS_MIN_JOB_NUM                 20
++#define OT_VGS_MAX_TASK_NUM                400
++#define OT_VGS_MIN_TASK_NUM                20
++#define OT_VGS_MAX_NODE_NUM                400
++#define OT_VGS_MIN_NODE_NUM                20
++
++/* For TDE */
++#define OT_TDE_MAX_NODE_NUM               500
++#define OT_TDE_MIN_NODE_NUM                2
++#define OT_TDE_DEFAULT_NODE_NUM           100
++
++/* For GDC */
++#define OT_FISHEYE_MIN_IN_IMAGE_WIDTH     352
++#define OT_FISHEYE_MIN_IN_IMAGE_HEIGHT    288
++#define OT_FISHEYE_MIN_OUT_IMAGE_WIDTH    352
++#define OT_FISHEYE_MIN_OUT_IMAGE_HEIGHT   288
++
++#define OT_LDC_MIN_IMAGE_WIDTH            120
++#define OT_LDC_MIN_IMAGE_HEIGHT           88
++
++#define OT_SPREAD_MIN_IMAGE_WIDTH         120
++#define OT_SPREAD_MIN_IMAGE_HEIGHT        88
++
++#define OT_ROTATION_EX_MIN_IMAGE_WIDTH    120
++#define OT_ROTATION_EX_MIN_IMAGE_HEIGHT   88
++
++#define OT_PMF_MIN_IMAGE_WIDTH            120
++#define OT_PMF_MIN_IMAGE_HEIGHT           88
++
++#define OT_GDC_MAX_IMAGE_WIDTH            8192
++#define OT_GDC_MAX_IMAGE_HEIGHT           8192
++#define OT_GDC_IP_NUM                     1
++
++#define OT_GDC_MAX_JOB_NUM              100  /* gdc max job number */
++#define OT_GDC_MIN_JOB_NUM              4   /* gdc min job number */
++
++#define OT_GDC_MAX_TASK_NUM             200  /* gdc max task number */
++#define OT_GDC_MIN_TASK_NUM             4   /* gdc min task number */
++
++#define OT_GDC_MAX_NODE_NUM             200  /* gdc max node number */
++#define OT_GDC_MIN_NODE_NUM             4   /* gdc min node number */
++
++#define OT_GDC_DEFAULT_JOB_NUM          16
++#define OT_GDC_DEFAULT_TASK_NUM         50
++#define OT_GDC_DEFAULT_NODE_NUM         50
++
++/* For MCF */
++#define OT_MCF_PIPE_NUM                   2
++#define OT_MCF_MAX_GRP_NUM                2
++#define OT_MCF_MAX_PHYS_CHN_NUM           3
++#define OT_MCF_MAX_EXT_CHN_NUM            4
++#define OT_MCF_MAX_CHN_NUM                (OT_MCF_MAX_PHYS_CHN_NUM + OT_MCF_MAX_EXT_CHN_NUM)
++
++#define OT_MCF_MAX_PIPE_WIDTH        8192
++#define OT_MCF_MAX_PIPE_HEIGHT       4096
++#define OT_MCF_MIN_PIPE_WIDTH        256
++#define OT_MCF_MIN_PIPE_HEIGHT       256
++
++#define OT_MCF_MAX_CHN_WIDTH        8192
++#define OT_MCF_MAX_CHN_HEIGHT       8192
++#define OT_MCF_MIN_CHN_WIDTH        128
++#define OT_MCF_MIN_CHN_HEIGHT       64
++
++#define OT_MCF_MAX_EXT_CHN_WIDTH        8192
++#define OT_MCF_MAX_EXT_CHN_HEIGHT       8192
++#define OT_MCF_MIN_EXT_CHN_WIDTH        64
++#define OT_MCF_MIN_EXT_CHN_HEIGHT       64
++
++/* For UVC */
++#define OT_UVC_MAX_CHN_NUM           2 /* max chn num */
++
++#define OT_AIISP_PIPE_MIN_WIDTH      960
++#define OT_AIISP_PIPE_MIN_HEIGHT     540
++#define OT_AIISP_PIPE_MAX_WIDTH      3840
++#define OT_AIISP_PIPE_MAX_HEIGHT     2160
++
++#ifdef __cplusplus
++#if __cplusplus
++}
++#endif
++#endif /* __cplusplus */
++
++#endif /* OT_DEFINES_H */
+diff --git a/sdk/hi3516cv6xx/include/ot_errno.h b/sdk/hi3516cv6xx/include/ot_errno.h
+new file mode 100644
+index 0000000..e8953cd
+--- /dev/null
++++ b/sdk/hi3516cv6xx/include/ot_errno.h
+@@ -0,0 +1,96 @@
++/*
++  Copyright (c), 2001-2025, Shenshu Tech. Co., Ltd.
++ */
++
++#ifndef OT_ERRNO_H
++#define OT_ERRNO_H
++
++#include "ot_debug.h"
++
++#ifdef __cplusplus
++#if __cplusplus
++extern "C" {
++#endif
++#endif /* end of #ifdef __cplusplus */
++
++/*
++ * 1010 0000b
++ * VTOP use APPID from 0~31
++ * so, vendor use APPID based on 32
++ */
++#define OT_ERR_APP_ID (0x80000000L + 0x20000000L)
++
++/*
++ * |----------------------------------------------------------------|
++ * | 1 |   APP_ID   |   MOD_ID    | ERR_LEVEL |   ERR_ID            |
++ * |----------------------------------------------------------------|
++ * |<--><--7bits----><----8bits---><--3bits---><------13bits------->|
++ */
++#define OT_DEFINE_ERR(mod, level, err_id) \
++    ((td_s32)((OT_ERR_APP_ID) | ((mod) << 16) | ((level) << 13) | (err_id)))
++
++/*
++ * NOTE! the following defined all common error code,
++ * all module must reserved 0~63 for their common error code
++ */
++typedef enum {
++    OT_ERR_LEVEL_DEBUG = 0,  /* debug-level                                  */
++    OT_ERR_LEVEL_INFO,       /* informational                                */
++    OT_ERR_LEVEL_NOTICE,     /* normal but significant condition             */
++    OT_ERR_LEVEL_WARNING,    /* warning conditions                           */
++    OT_ERR_LEVEL_ERROR,      /* error conditions                             */
++    OT_ERR_LEVEL_CRIT,       /* critical conditions                          */
++    OT_ERR_LEVEL_ALERT,      /* action must be taken immediately             */
++    OT_ERR_LEVEL_FATAL,      /* just for compatibility with previous version */
++    OT_ERR_LEVEL_BUTT
++} ot_err_level;
++
++typedef enum {
++    OT_ERR_INVALID_DEV_ID  =  0x1, /* invalid device ID                          */
++    OT_ERR_INVALID_PIPE_ID =  0x2, /* invalid pipe ID                           */
++    OT_ERR_INVALID_CHN_ID  =  0x3, /* invalid channel ID                          */
++    OT_ERR_INVALID_LAYER_ID = 0x4, /* invalid channel ID                          */
++    OT_ERR_INVALID_GRP_ID   = 0x5, /* invalid group ID                          */
++    OT_ERR_INVALID_LANE_ID   = 0x6, /* invalid lane ID                          */
++
++    OT_ERR_ILLEGAL_PARAM   = 0x7, /* at lease one parameter is illegal
++                               * eg, an illegal enumeration value             */
++    OT_ERR_EXIST           = 0x8, /* resource exists                              */
++    OT_ERR_UNEXIST         = 0x9, /* resource not exists                            */
++    OT_ERR_NULL_PTR        = 0xa, /* using a NULL pointer                           */
++    OT_ERR_NOT_CFG         = 0xb, /* try to enable or initialize system, device
++                              ** or channel, before configing attribute       */
++    OT_ERR_NOT_SUPPORT     = 0xc, /* operation or type is not supported by NOW    */
++    OT_ERR_NOT_PERM        = 0xd, /* operation is not permitted
++                              ** eg, try to change static attribute           */
++    OT_ERR_NOT_ENABLE      = 0x10,
++    OT_ERR_NOT_DISABLE     = 0x11,
++    OT_ERR_NOT_START       = 0x12,
++    OT_ERR_NOT_STOP        = 0x13,
++    OT_ERR_NO_MEM          = 0x14, /* failure caused by malloc memory              */
++    OT_ERR_NO_BUF          = 0x15, /* failure caused by malloc buffer              */
++    OT_ERR_BUF_EMPTY       = 0x16, /* no data in buffer                            */
++    OT_ERR_BUF_FULL        = 0x17, /* no buffer for new data                       */
++    OT_ERR_NOT_READY       = 0x18, /* System is not ready, maybe not initialed or
++                              ** loaded. Returning the error code when opening
++                              ** a device file failed.                        */
++    OT_ERR_TIMEOUT         = 0x20,
++    OT_ERR_BAD_ADDR        = 0x21, /* bad address,
++                              ** eg. used for copy_from_user & copy_to_user   */
++    OT_ERR_BUSY            = 0x22, /* resource is busy,
++                              ** eg. destroy a venc chn without unregister it */
++    OT_ERR_SIZE_NOT_ENOUGH = 0x23, /* buffer size is smaller than the actual size required */
++
++    OT_ERR_NOT_BINDED      = 0x24,
++    OT_ERR_BINDED          = 0x25,
++    OT_ERR_BUTT            = 0x3f, /* maximum code, private error code of all modules
++                              ** must be greater than it                      */
++} ot_errno;
++
++#ifdef __cplusplus
++#if __cplusplus
++}
++#endif
++#endif /* __cplusplus */
++
++#endif /* OT_ERRNO_H */
+diff --git a/sdk/hi3516cv6xx/include/ot_type.h b/sdk/hi3516cv6xx/include/ot_type.h
+new file mode 100644
+index 0000000..d7b5dd7
+--- /dev/null
++++ b/sdk/hi3516cv6xx/include/ot_type.h
+@@ -0,0 +1,73 @@
++/*
++  Copyright (c), 2001-2025, Shenshu Tech. Co., Ltd.
++ */
++
++#ifndef OT_TYPE_H
++#define OT_TYPE_H
++
++#ifdef __KERNEL__
++
++#include <linux/types.h>
++#else
++
++#include <stdint.h>
++#endif
++#include "autoconf.h"
++
++#ifdef __cplusplus
++#if __cplusplus
++extern "C"{
++#endif
++#endif /* __cplusplus */
++
++#ifndef NULL
++    #define NULL                0L
++#endif
++
++#define TD_NULL                 0L
++#define TD_SUCCESS              0
++#define TD_FAILURE              (-1)
++
++typedef unsigned char           td_uchar;
++typedef unsigned char           td_u8;
++typedef unsigned short          td_u16;
++typedef unsigned int            td_u32;
++typedef unsigned long           td_ulong;
++
++typedef char                    td_char;
++typedef signed char             td_s8;
++typedef short                   td_s16;
++typedef int                     td_s32;
++typedef long                    td_slong;
++
++typedef float                   td_float;
++typedef double                  td_double;
++
++typedef void                    td_void;
++
++typedef unsigned long long  td_u64;
++typedef long long           td_s64;
++
++#ifdef CONFIG_PHYS_ADDR_BIT_WIDTH_64
++    typedef unsigned long long  td_phys_addr_t;
++#else
++    typedef unsigned int        td_phys_addr_t;
++#endif
++
++typedef td_u32                  td_handle;
++typedef uintptr_t               td_uintptr_t;
++typedef unsigned int            td_fr32;
++
++typedef enum {
++    TD_FALSE = 0,
++    TD_TRUE  = 1,
++} td_bool;
++
++#ifdef __cplusplus
++#if __cplusplus
++}
++#endif
++#endif /* __cplusplus */
++
++#endif /* OT_TYPE_H */
++
+diff --git a/sdk/hi3516cv6xx/include/ss_mpi_region.h b/sdk/hi3516cv6xx/include/ss_mpi_region.h
+new file mode 100644
+index 0000000..d17e11d
+--- /dev/null
++++ b/sdk/hi3516cv6xx/include/ss_mpi_region.h
+@@ -0,0 +1,45 @@
++/*
++  Copyright (c), 2001-2025, Shenshu Tech. Co., Ltd.
++ */
++
++#ifndef SS_MPI_REGION_H
++#define SS_MPI_REGION_H
++
++#include "ot_debug.h"
++#include "ot_common_region.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++td_s32 ss_mpi_rgn_create(ot_rgn_handle handle, const ot_rgn_attr *rgn_attr);
++td_s32 ss_mpi_rgn_destroy(ot_rgn_handle handle);
++
++td_s32 ss_mpi_rgn_get_attr(ot_rgn_handle handle, ot_rgn_attr *rgn_attr);
++td_s32 ss_mpi_rgn_set_attr(ot_rgn_handle handle, const ot_rgn_attr *rgn_attr);
++
++td_s32 ss_mpi_rgn_set_bmp(ot_rgn_handle handle, const ot_bmp *bmp);
++
++td_s32 ss_mpi_rgn_attach_to_chn(ot_rgn_handle handle, const ot_mpp_chn *chn, const ot_rgn_chn_attr *chn_attr);
++td_s32 ss_mpi_rgn_detach_from_chn(ot_rgn_handle handle, const ot_mpp_chn *chn);
++
++td_s32 ss_mpi_rgn_attach_to_dev(ot_rgn_handle handle, const ot_mpp_chn *chn, const ot_rgn_chn_attr *chn_attr);
++td_s32 ss_mpi_rgn_detach_from_dev(ot_rgn_handle handle, const ot_mpp_chn *chn);
++
++td_s32 ss_mpi_rgn_set_chn_display_attr(ot_rgn_handle handle, const ot_mpp_chn *chn, const ot_rgn_chn_attr *chn_attr);
++td_s32 ss_mpi_rgn_get_chn_display_attr(ot_rgn_handle handle, const ot_mpp_chn *chn, ot_rgn_chn_attr *chn_attr);
++
++td_s32 ss_mpi_rgn_set_dev_display_attr(ot_rgn_handle handle, const ot_mpp_chn *chn, const ot_rgn_chn_attr *chn_attr);
++td_s32 ss_mpi_rgn_get_dev_display_attr(ot_rgn_handle handle, const ot_mpp_chn *chn, ot_rgn_chn_attr *chn_attr);
++
++td_s32 ss_mpi_rgn_get_canvas_info(ot_rgn_handle handle, ot_rgn_canvas_info *canvas_info);
++td_s32 ss_mpi_rgn_update_canvas(ot_rgn_handle handle);
++
++td_s32 ss_mpi_rgn_batch_begin(ot_rgn_handle_grp *grp, td_u32 handle_num, const ot_rgn_handle handle[]);
++td_s32 ss_mpi_rgn_batch_end(ot_rgn_handle_grp grp);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
+\ No newline at end of file
+-- 
+2.51.0
+

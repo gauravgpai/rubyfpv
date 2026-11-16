@@ -1,0 +1,28 @@
+#!/bin/sh
+#
+# wifibroadcast's video_settings (first boot, and `wifibroadcast reset`) is
+# written for SigmaStar: it points isp.sensorConfig at
+# /etc/sensors/<sensor>_<family>.bin, which only the Infinity6 sensor
+# packages ship, and asks for 60 fps. Neither exists on cv6xx. Sorted right
+# after S98wifibroadcast, this puts the board's 2-lane IMX335 profile back
+# whenever the configured profile is a file that is not there.
+
+case "$1" in
+	start)
+		cfg=$(cli -g .isp.sensorConfig)
+		[ -n "$cfg" ] && [ ! -e "$cfg" ] || exit 0
+		echo "Replacing isp.sensorConfig $cfg with the 2-lane IMX335 1080p60 profile" | logger -s -t wifibroadcast
+		cli -s .isp.sensorConfig /etc/sensors/imx335_2l_1080p60.ini
+		cli -s .video0.size 1920x1080
+		cli -s .video0.fps 60
+		killall -1 majestic
+		;;
+
+	stop)
+		;;
+
+	*)
+		echo "Usage: $0 {start|stop}"
+		exit 1
+		;;
+esac

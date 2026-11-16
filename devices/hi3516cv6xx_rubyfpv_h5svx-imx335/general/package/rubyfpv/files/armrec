@@ -1,0 +1,221 @@
+#!/bin/sh
+# armrec: record the camera's video to the SD card while the flight controller
+# is armed, and for STOP_DELAY seconds after it disarms. Re-arming inside the
+# delay keeps the same recording going.
+#
+#   armrec setup   before majestic starts (S72armrec): point the recorder at the card
+#   armrec run     the watcher loop (S72armrec starts it in the background)
+#   armrec status  print what the watcher and the recorder are doing
+#
+# Arming comes from Ruby: ruby_tx_telemetry keeps /tmp/ruby/tmp/armed while the
+# flight controller reports armed (MAVLink; MSP with 0003-msp-armed-flag-file).
+#
+# Recording is switched with majestic's pause and resume calls
+# (/api/v1/records/standdown, /api/v1/records/resume), which leave the encoder
+# and the live stream alone, and each resume opens a new file. records.enabled
+# itself is only changed while disarmed: changing it rebuilds majestic's
+# pipeline, a ~0.7 s gap in the live video.
+#
+# Settings: /etc/armrec.conf
+
+ENABLED=1
+STOP_DELAY=30
+FOLDER=fpv
+MAX_USAGE=90
+SYNC_SECONDS=5
+[ -f /etc/armrec.conf ] && . /etc/armrec.conf
+
+ARMED_FILE=/tmp/ruby/tmp/armed
+API=http://127.0.0.1/api/v1/records
+STATE=/tmp/armrec.state
+MARK=/tmp/armrec.mark
+PIDFILE=/var/run/armrec.pid
+
+log() { logger -t armrec "$*"; }
+
+# Mount point of the SD card, if one is mounted (mdev automount puts it under /mnt).
+card_mount() {
+	[ -n "$ARMREC_CARD" ] && { echo "$ARMREC_CARD"; return; } # testing only
+	awk '$1 ~ /^\/dev\/mmcblk[0-9]+(p[0-9]+)?$/ && $2 ~ /^\/mnt\// && $4 ~ /^rw/ { print $2; exit }' /proc/mounts
+}
+
+# Point majestic's recorder at <mount>/$FOLDER with a new session number, so
+# files from different power-ups never share a name (the camera has no RTC).
+configure_card() {
+	dir=$1/$FOLDER
+	mkdir -p "$dir" || return 1
+	n=$(cat "$dir/.session" 2>/dev/null)
+	case "$n" in '' | *[!0-9]*) n=0 ;; esac
+	n=$((n + 1))
+	echo "$n" > "$dir/.session" && sync
+	session=$(printf 's%04d' "$n")
+	cli -s .records.path "$dir"
+	cli -s .records.filename "${session}_%H%M%S"
+	cli -s .records.mode continuous
+	cli -s .records.syncSeconds "$SYNC_SECONDS"
+	cli -s .records.maxUsage "$MAX_USAGE"
+	cli -s .records.enabled true
+	log "recording to $dir as ${session}_*.mp4 while armed (+${STOP_DELAY}s after disarm)"
+}
+
+recorder_enabled() { [ "$(cli -g .records.enabled 2>/dev/null)" = true ]; }
+
+do_setup() {
+	if [ "$ENABLED" != 1 ]; then
+		recorder_enabled && cli -s .records.enabled false
+		return 0
+	fi
+	mnt=$(card_mount)
+	if [ -n "$mnt" ]; then
+		configure_card "$mnt"
+	elif recorder_enabled; then
+		cli -s .records.enabled false
+		log "no SD card: recorder off"
+	fi
+}
+
+# POST pause or resume; sets $stood to 1 (paused) or 0 (recording), "" on failure.
+records_call() {
+	r=$(curl -s -m 2 -X POST "$API/$1" 2>/dev/null)
+	case "$r" in
+		*'"stoodDown":true'*) stood=1 ;;
+		*'"stoodDown":false'*) stood=0 ;;
+		*) stood= ;;
+	esac
+}
+
+clips() { ls "$1" 2>/dev/null | grep '\.mp4$'; }
+
+# The clips on the card while the recorder is known to be paused. A clip that
+# is not in this list and appears while disarmed is a start-up stub (majestic
+# records from its first frame until it is paused again).
+snapshot() {
+	clipdir=$(cli -g .records.path 2>/dev/null)
+	clips "$clipdir" > "$MARK"
+}
+
+do_run() {
+	echo $$ > "$PIDFILE"
+	recorder_on && snapshot
+	mpid=
+	stood=
+	stub_check=0
+	stop_at=0
+	was_armed=0
+	renew_at=0
+	card_check_at=0
+	while :; do
+		read -r up _ < /proc/uptime
+		t=${up%.*}
+
+		if [ -e "$ARMED_FILE" ]; then
+			armed=1
+		else
+			armed=0
+		fi
+		if [ $armed = 1 ]; then
+			[ $was_armed = 0 ] && log "armed: recording"
+			stop_at=0
+		elif [ $was_armed = 1 ]; then
+			stop_at=$((t + STOP_DELAY))
+			log "disarmed: stopping in ${STOP_DELAY}s"
+		fi
+		was_armed=$armed
+
+		want=0
+		if [ $armed = 1 ] || [ $t -lt $stop_at ]; then
+			want=1
+		fi
+
+		# majestic (re)started? Ruby restarts it when camera settings change.
+		if [ -z "$mpid" ] || [ ! -d "/proc/$mpid" ]; then
+			mpid=$(pidof majestic)
+			stood=
+			stub_check=0
+			[ -n "$mpid" ] && [ "$want" = 0 ] && stub_check=1
+		fi
+
+		if [ -n "$mpid" ] && recorder_on; then
+			if [ "$want" = 1 ] && [ "$stood" != 0 ]; then
+				records_call resume
+				if [ "$stood" = 0 ]; then
+					log "recorder running"
+					stub_check=0
+				fi
+			elif [ "$want" = 0 ] && [ "$stood" != 1 ]; then
+				records_call standdown
+				if [ "$stood" = 1 ]; then
+					renew_at=$((t + 240))
+					if [ $stub_check = 1 ]; then
+						stub_check=0
+						clips "$clipdir" | grep -vxF -f "$MARK" | while read -r f; do
+							rm -f "$clipdir/$f" && log "removed start-up stub $f"
+						done
+					else
+						log "recorder paused"
+					fi
+					# A clip with no frames in it is only an MP4 header.
+					[ -d "$clipdir" ] && find "$clipdir" -maxdepth 1 -type f \
+						-name '*.mp4' -size -8k -exec rm -f {} \;
+					snapshot
+				fi
+			elif [ "$stood" = 1 ] && [ $t -ge $renew_at ]; then
+				# A pause lifts itself after 600 s; renew it.
+				records_call standdown
+				renew_at=$((t + 240))
+			fi
+		fi
+
+		# Card inserted or removed after boot: only reconfigure while idle on
+		# the ground, because changing records.enabled rebuilds the pipeline.
+		if [ $t -ge $card_check_at ]; then
+			card_check_at=$((t + 5))
+			if [ "$want" = 0 ] && [ "$armed" = 0 ]; then
+				mnt=$(card_mount)
+				if [ -n "$mnt" ] && ! recorder_on; then
+					if configure_card "$mnt"; then
+						snapshot
+						stub_check=1
+						killall -1 majestic 2>/dev/null
+					fi
+					rec_cached=
+					stood=
+				elif [ -z "$mnt" ] && recorder_on; then
+					cli -s .records.enabled false && killall -1 majestic 2>/dev/null
+					log "SD card removed: recorder off"
+					rec_cached=
+					stood=
+				fi
+			fi
+		fi
+
+		echo "armed=$armed want=$want paused=${stood:-?} stop_in=$((stop_at > t ? stop_at - t : 0)) majestic=${mpid:-none}" > "$STATE"
+		usleep 500000
+	done
+}
+
+# records.enabled, cached between reconfigurations (cli reads the yaml file).
+rec_cached=
+recorder_on() {
+	if [ -z "$rec_cached" ]; then
+		if recorder_enabled; then rec_cached=1; else rec_cached=0; fi
+	fi
+	[ "$rec_cached" = 1 ]
+}
+
+case "$1" in
+	setup) do_setup ;;
+	run)
+		[ "$ENABLED" = 1 ] || exit 0
+		do_run
+		;;
+	status)
+		cat "$STATE" 2>/dev/null || echo "armrec is not running"
+		echo "card: $(card_mount || true)"
+		echo "records.enabled: $(cli -g .records.enabled) path: $(cli -g .records.path)"
+		;;
+	*)
+		echo "usage: $0 {setup|run|status}" >&2
+		exit 1
+		;;
+esac
