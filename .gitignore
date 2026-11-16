@@ -6,3 +6,4 @@ firmware/
 *.zip
 *.so
 build.log
+!stock-firmware/*.bin

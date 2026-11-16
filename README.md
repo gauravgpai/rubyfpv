@@ -709,6 +709,7 @@ ground/rubyfpv-radxa/   controller patches and build scripts
 tools/                  kernel config generator, TFTP servers, ground-station emulator, helpers
 work/                   test scripts, lens probes, serial and recovery helpers
 archive/                superseded drafts
+stock-firmware/         flash dumps of two cameras on stock firmware
 FLASHING.md             flashing and recovery steps
 ```
 
